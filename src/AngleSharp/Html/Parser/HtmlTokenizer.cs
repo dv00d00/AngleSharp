@@ -7,7 +7,9 @@ namespace AngleSharp.Html.Parser
     using AngleSharp.Html.Parser.Tokens;
     using AngleSharp.Text;
     using System;
+    using System.Buffers;
     using System.Collections.Generic;
+    using AttributeName = System.String;
 
     /// <summary>
     /// Performs the tokenization of the source code. Follows the tokenization algorithm at:
@@ -39,7 +41,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="source">The source code manager.</param>
         /// <param name="resolver">The entity resolver to use.</param>
-        public HtmlTokenizer(TextSource source, IEntityProvider resolver)
+        public HtmlTokenizer(IReadOnlyTextSource source, IEntityProvider resolver)
             : base(source)
         {
             State = HtmlParseMode.PCData;
@@ -52,7 +54,29 @@ namespace AngleSharp.Html.Parser
 
         #endregion
 
+        private static readonly HtmlToken EmptyCharacterToken = new HtmlToken(HtmlTokenType.Character, new TextPosition(), "");
+
         #region Properties
+
+        /// <summary>
+        ///
+        /// </summary>
+        public bool SkipDataText { get; set; } = false;
+
+        /// <summary>
+        ///
+        /// </summary>
+        public bool SkipScriptText { get; set; } = false;
+
+        /// <summary>
+        ///
+        /// </summary>
+        public bool SkipRawText { get; set; } = false;
+
+        /// <summary>
+        ///
+        /// </summary>
+        public Func<HtmlTagToken, AttributeName, Boolean> ShouldEmitAttribute { get; set; } = (_, _) => true;
 
         /// <summary>
         /// Gets or sets if CDATA sections are accepted.
@@ -180,6 +204,11 @@ namespace AngleSharp.Html.Parser
                     case Symbols.LessThan:
                     case Symbols.EndOfFile:
                         Back();
+                        if (SkipDataText)
+                        {
+                            StringBuffer.Clear();
+                            return EmptyCharacterToken;
+                        }
                         return NewCharacter();
 
                     case Symbols.Ampersand:
@@ -359,6 +388,11 @@ namespace AngleSharp.Html.Parser
                     case Symbols.LessThan:
                     case Symbols.EndOfFile:
                         Back();
+                        if (SkipRawText)
+                        {
+                            StringBuffer.Clear();
+                            return EmptyCharacterToken;
+                        }
                         return NewCharacter();
 
                     case Symbols.Null:
@@ -495,7 +529,7 @@ namespace AngleSharp.Html.Parser
                 }
                 else
                 {
-                    entity = GetLookupCharacterReference(c, allowedCharacter, isAttribute);
+                    entity = GetLookupCharacterReference(allowedCharacter, isAttribute);
                 }
 
                 if (entity is null)
@@ -582,11 +616,12 @@ namespace AngleSharp.Html.Parser
             return Char.ConvertFromUtf32(num);
         }
 
-        private String? GetLookupCharacterReference(Char c, Char allowedCharacter, Boolean isAttribute)
+        private String? GetLookupCharacterReference(Char allowedCharacter, Boolean isAttribute)
         {
             var entity = default(String);
             var start = InsertionPoint - 1;
-            var reference = new Char[32];
+            using var lease = ArrayPool<Char>.Shared.Borrow(32);
+            Memory<Char> reference = lease.Data.AsMemory(0, 32);
             var index = 0;
             var chr = Current;
 
@@ -597,21 +632,21 @@ namespace AngleSharp.Html.Parser
                     break;
                 }
 
-                reference[index++] = chr;
+                reference.Span[index++] = chr;
                 chr = GetNext();
             }
             while (chr != Symbols.EndOfFile && index < 31);
 
             if (chr == Symbols.Semicolon)
             {
-                reference[index] = Symbols.Semicolon;
-                var value = new String(reference, 0, index + 1);
+                reference.Span[index] = Symbols.Semicolon;
+                var value = reference.Slice(0, index + 1);
                 entity = _resolver.GetSymbol(value);
             }
 
             while (entity is null && index > 0)
             {
-                var value = new String(reference, 0, index--);
+                var value = reference.Slice(0, index--);
                 entity = _resolver.GetSymbol(value);
 
                 if (entity is null)
@@ -1741,6 +1776,7 @@ namespace AngleSharp.Html.Parser
             var quote = Symbols.DoubleQuote;
             var c = Symbols.Null;
             var pos = GetCurrentPosition();
+            var attributeAllowed = false;
 
             while (true)
             {
@@ -1799,22 +1835,43 @@ namespace AngleSharp.Html.Parser
 
                         if (c == Symbols.Equality)
                         {
-                            tag.AddAttribute(FlushBuffer(), pos);
+                            var attributeName = FlushBuffer();
+                            attributeAllowed = ShouldEmitAttribute(tag, attributeName);
+                            if (attributeAllowed)
+                            {
+                                tag.AddAttribute(attributeName, pos);
+                            }
                             state = AttributeState.BeforeValue;
                         }
                         else if (c == Symbols.GreaterThan)
                         {
-                            tag.AddAttribute(FlushBuffer(), pos);
+                            var attributeName = FlushBuffer();
+                            attributeAllowed = ShouldEmitAttribute(tag, attributeName);
+                            if (attributeAllowed)
+                            {
+                                tag.AddAttribute(attributeName, pos);
+                            }
+
                             return EmitTag(tag);
                         }
                         else if (c.IsSpaceCharacter())
                         {
-                            tag.AddAttribute(FlushBuffer(), pos);
+                            var attributeName = FlushBuffer();
+                            attributeAllowed = ShouldEmitAttribute(tag, attributeName);
+                            if (attributeAllowed)
+                            {
+                                tag.AddAttribute(attributeName, pos);
+                            }
                             state = AttributeState.AfterName;
                         }
                         else if (c == Symbols.Solidus)
                         {
-                            tag.AddAttribute(FlushBuffer(), pos);
+                            var attributeName = FlushBuffer();
+                            attributeAllowed = ShouldEmitAttribute(tag, attributeName);
+                            if (attributeAllowed)
+                            {
+                                tag.AddAttribute(attributeName, pos);
+                            }
                             state = AttributeState.SelfClose;
                         }
                         else if (c.IsUppercaseAscii() && !IsPreservingAttributeNames)
@@ -1946,7 +2003,15 @@ namespace AngleSharp.Html.Parser
 
                         if (c == quote)
                         {
-                            tag.SetAttributeValue(FlushBuffer());
+                            if (attributeAllowed)
+                            {
+                                var value = FlushBuffer();
+                                tag.SetAttributeValue(value);
+                            }
+                            else
+                            {
+                                StringBuffer.Clear();
+                            }
                             state = AttributeState.AfterValue;
                         }
                         else if (c == Symbols.Ampersand)
@@ -1974,12 +2039,28 @@ namespace AngleSharp.Html.Parser
                     {
                         if (c == Symbols.GreaterThan)
                         {
-                            tag.SetAttributeValue(FlushBuffer());
+                            if (attributeAllowed)
+                            {
+                                var value = FlushBuffer();
+                                tag.SetAttributeValue(value);
+                            }
+                            else
+                            {
+                                StringBuffer.Clear();
+                            }
                             return EmitTag(tag);
                         }
                         else if (c.IsSpaceCharacter())
                         {
-                            tag.SetAttributeValue(FlushBuffer());
+                            if (attributeAllowed)
+                            {
+                                var value = FlushBuffer();
+                                tag.SetAttributeValue(value);
+                            }
+                            else
+                            {
+                                StringBuffer.Clear();
+                            }
                             state = AttributeState.BeforeName;
                         }
                         else if (c == Symbols.Ampersand)
@@ -2198,15 +2279,23 @@ namespace AngleSharp.Html.Parser
 
                             if (hasLength && (isspace || isclosed || isslash))
                             {
-                                var name = StringBuffer.ToString(offset, length);
-
-                                if (name.Isi(_lastStartTag))
+                                using var lease = ArrayPool<Char>.Shared.Borrow(length);
+                                StringBuffer.CopyTo(offset, lease.Span, length);
+                                if (lease.Span.Isi(_lastStartTag))
                                 {
                                     if (offset > 2)
                                     {
                                         Back(3 + length);
                                         StringBuffer.Remove(offset - 2, length + 2);
-                                        return NewCharacter();
+                                        if (SkipScriptText)
+                                        {
+                                            StringBuffer.Clear();
+                                            return EmptyCharacterToken;
+                                        }
+                                        else
+                                        {
+                                            return NewCharacter();
+                                        }
                                     }
 
                                     StringBuffer.Clear();
@@ -2375,12 +2464,16 @@ namespace AngleSharp.Html.Parser
                         c = GetNext();
                         var hasLength = StringBuffer.Length - offset == scriptLength;
 
-                        if (hasLength && (c == Symbols.Solidus || c == Symbols.GreaterThan || c.IsSpaceCharacter()) &&
-                            StringBuffer.ToString(offset, scriptLength).Isi(TagNames.Script))
+                        if (hasLength && (c == Symbols.Solidus || c == Symbols.GreaterThan || c.IsSpaceCharacter()))
                         {
-                            Back(scriptLength + 3);
-                            StringBuffer.Remove(offset - 2, scriptLength + 2);
-                            return NewCharacter();
+                            using var lease = ArrayPool<Char>.Shared.Borrow(scriptLength);
+                            StringBuffer.CopyTo(offset, lease.Span, scriptLength);
+                            if (lease.Span.Isi(TagNames.Script))
+                            {
+                                Back(scriptLength + 3);
+                                StringBuffer.Remove(offset - 2, scriptLength + 2);
+                                return NewCharacter();
+                            }
                         }
                         else if (!c.IsLetter())
                         {
@@ -2402,7 +2495,10 @@ namespace AngleSharp.Html.Parser
 
                         if (hasLength && (c == Symbols.Solidus || c == Symbols.GreaterThan || c.IsSpaceCharacter()))
                         {
-                            var isscript = StringBuffer.ToString(offset, scriptLength).Isi(TagNames.Script);
+                            using var lease = ArrayPool<Char>.Shared.Borrow(scriptLength);
+                            StringBuffer.CopyTo(offset, lease.Span, scriptLength);
+                            var isscript = lease.Span.Isi(TagNames.Script);
+
                             StringBuffer.Append(c);
                             c = GetNext();
                             state = isscript ? ScriptState.EscapedDouble : ScriptState.Escaped;
@@ -2550,7 +2646,9 @@ namespace AngleSharp.Html.Parser
 
                         if (hasLength && (c.IsSpaceCharacter() || c == Symbols.Solidus || c == Symbols.GreaterThan))
                         {
-                            var isscript = StringBuffer.ToString(offset, scriptLength).Isi(TagNames.Script);
+                            using var lease = ArrayPool<Char>.Shared.Borrow(scriptLength);
+                            StringBuffer.CopyTo(offset, lease.Span, scriptLength);
+                            var isscript = lease.Span.Isi(TagNames.Script);
                             StringBuffer.Append(c);
                             c = GetNext();
                             state = isscript ? ScriptState.Escaped : ScriptState.EscapedDouble;
@@ -2642,25 +2740,30 @@ namespace AngleSharp.Html.Parser
             var isslash = c == Symbols.Solidus;
             var hasLength = StringBuffer.Length == _lastStartTag.Length;
 
-            if (hasLength && (isspace || isclosed || isslash) && StringBuffer.ToString().Is(_lastStartTag))
+            if (hasLength && (isspace || isclosed || isslash))
             {
-                var tag = NewTagClose();
-                StringBuffer.Clear();
+                using var lease = ArrayPool<Char>.Shared.Borrow(StringBuffer.Length);
+                StringBuffer.CopyTo(0, lease.Span, StringBuffer.Length);
+                if (lease.Span.Is(_lastStartTag))
+                {
+                    var tag = NewTagClose();
+                    StringBuffer.Clear();
 
-                if (isspace)
-                {
-                    tag.Name = _lastStartTag;
-                    return ParseAttributes(tag);
-                }
-                else if (isslash)
-                {
-                    tag.Name = _lastStartTag;
-                    return TagSelfClosing(tag);
-                }
-                else if (isclosed)
-                {
-                    tag.Name = _lastStartTag;
-                    return EmitTag(tag);
+                    if (isspace)
+                    {
+                        tag.Name = _lastStartTag;
+                        return ParseAttributes(tag);
+                    }
+                    else if (isslash)
+                    {
+                        tag.Name = _lastStartTag;
+                        return TagSelfClosing(tag);
+                    }
+                    else if (isclosed)
+                    {
+                        tag.Name = _lastStartTag;
+                        return EmitTag(tag);
+                    }
                 }
             }
 
@@ -2681,7 +2784,7 @@ namespace AngleSharp.Html.Parser
                         {
                             if (attributes[j].Name.Is(attributes[i].Name))
                             {
-                                attributes.RemoveAt(i);
+                                tag.RemoveAttributeAt(i);
                                 RaiseErrorOccurred(HtmlParseError.AttributeDuplicateOmitted, tag.Position);
                                 break;
                             }

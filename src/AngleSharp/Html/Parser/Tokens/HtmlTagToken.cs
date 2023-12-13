@@ -10,9 +10,11 @@ namespace AngleSharp.Html.Parser.Tokens
     /// </summary>
     public sealed class HtmlTagToken : HtmlToken, ISourceReference
     {
+        private static readonly List<HtmlAttributeToken> Empty = new List<HtmlAttributeToken>();
+
         #region Fields
 
-        private readonly List<HtmlAttributeToken> _attributes = new List<HtmlAttributeToken>();
+        private List<HtmlAttributeToken>? _attributes;
         private Boolean _selfClosing;
 
         #endregion
@@ -80,7 +82,7 @@ namespace AngleSharp.Html.Parser.Tokens
         /// <summary>
         /// Gets the list of attributes.
         /// </summary>
-        public List<HtmlAttributeToken> Attributes => _attributes;
+        public IReadOnlyList<HtmlAttributeToken> Attributes => _attributes ?? Empty;
 
         #endregion
 
@@ -94,6 +96,7 @@ namespace AngleSharp.Html.Parser.Tokens
         /// <param name="position">The starting position of the attribute.</param>
         public void AddAttribute(String name, TextPosition position)
         {
+            _attributes ??= new List<HtmlAttributeToken>();
             _attributes.Add(new HtmlAttributeToken(position, name, String.Empty));
         }
 
@@ -104,6 +107,7 @@ namespace AngleSharp.Html.Parser.Tokens
         /// <param name="value">The value of the attribute.</param>
         public void AddAttribute(String name, String value)
         {
+            _attributes ??= new List<HtmlAttributeToken>();
             _attributes.Add(new HtmlAttributeToken(TextPosition.Empty, name, value));
         }
 
@@ -113,7 +117,7 @@ namespace AngleSharp.Html.Parser.Tokens
         /// <param name="value">The value to set.</param>
         public void SetAttributeValue(String value)
         {
-            var last = _attributes.Count - 1;
+            var last = _attributes!.Count - 1;
             var attr = _attributes[last];
             _attributes[last] = new HtmlAttributeToken(attr.Position, attr.Name, value);
         }
@@ -126,6 +130,9 @@ namespace AngleSharp.Html.Parser.Tokens
         /// <returns>The value of the attribute.</returns>
         public String GetAttribute(String name)
         {
+            if (_attributes == null)
+                return String.Empty;
+
             for (var i = 0; i != _attributes.Count; i++)
             {
                 var attr = _attributes[i];
@@ -139,6 +146,20 @@ namespace AngleSharp.Html.Parser.Tokens
             return String.Empty;
         }
 
+        /// <summary>
+        /// Removes attribute with index i.
+        /// </summary>
+        /// <param name="i">idx</param>
+        public void RemoveAttributeAt(Int32 i)
+        {
+            if (_attributes != null && i < _attributes.Count)
+            {
+                _attributes.RemoveAt(i);
+            }
+        }
+
         #endregion
+
+
     }
 }

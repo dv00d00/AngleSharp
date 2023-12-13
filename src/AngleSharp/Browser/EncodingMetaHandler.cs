@@ -27,7 +27,17 @@ namespace AngleSharp.Browser
             if (encoding != null)
             {
                 var document = element.Owner!;
-                document.Source.CurrentEncoding = encoding;
+                if (!Equals(document.Source.CurrentEncoding, encoding))
+                {
+                    if (document.WritableSource != null)
+                    {
+                        document.WritableSource.CurrentEncoding = encoding;
+                    }
+                    else
+                    {
+                        // TODO
+                    }
+                }
             }
         }
 
@@ -49,7 +59,7 @@ namespace AngleSharp.Browser
                     return TextEncoding.Resolve(charset);
                 }
             }
-            
+
             var shouldParseContent = element.HttpEquivalent.Isi(HeaderNames.ContentType);
             return shouldParseContent ? TextEncoding.Parse(element.Content ?? String.Empty) : null;
         }
