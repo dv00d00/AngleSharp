@@ -3,27 +3,31 @@ namespace AngleSharp.Html.Parser
     using AngleSharp.Dom;
     using AngleSharp.Html.Dom;
     using AngleSharp.Html.Dom.Events;
-    using AngleSharp.Html.Parser.Tokens;
     using AngleSharp.Io;
     using AngleSharp.Mathml.Dom;
     using AngleSharp.Svg.Dom;
     using AngleSharp.Text;
     using System;
     using System.Collections.Generic;
-    using System.Linq;
     using System.Threading;
     using System.Threading.Tasks;
+    using Common;
+    using Tokens.Struct;
+
+    public delegate void Next(ref StructHtmlToken token);
+    public enum Result { Continue, Stop }
+    public delegate Result Middleware(ref StructHtmlToken token, Next next);
 
     /// <summary>
     /// Represents the Tree construction as specified in
     /// 8.2.5 Tree construction, on the following page:
     /// http://www.w3.org/html/wg/drafts/html/master/syntax.html
     /// </summary>
-    sealed class HtmlDomBuilder
+    sealed class StructHtmlDomBuilder : IDisposable
     {
         #region Fields
 
-        private readonly IHtmlTokenizer _tokenizer;
+        private readonly StructHtmlTokenizer _tokenizer;
         private readonly HtmlDocument _document;
         private readonly List<Element> _openElements;
         private readonly List<Element> _formattingElements;
@@ -39,6 +43,8 @@ namespace AngleSharp.Html.Parser
         private Task? _waiting;
         private String? _stopAt;
         private Boolean _ended;
+
+        private StructHtmlToken _temp;
 
         #endregion
 
@@ -64,9 +70,10 @@ namespace AngleSharp.Html.Parser
         /// <param name="stopAt">
         ///     The name of the element where the parsing should be stopped.
         /// </param>
-        public HtmlDomBuilder(HtmlDocument document, String? stopAt = null)
+        /// <param name="maybeOptions"></param>
+        public StructHtmlDomBuilder(HtmlDocument document, String? stopAt = null, HtmlTokenizerOptions? maybeOptions = null)
         {
-            _tokenizer = new StructHtmlTokenizerAdapter(document.Source, document.Entities);
+            _tokenizer = new StructHtmlTokenizer(document.Source, document.Entities);
             _document = document;
             _openElements = new List<Element>();
             _templateModes = new Stack<HtmlTreeMode>();
@@ -75,6 +82,29 @@ namespace AngleSharp.Html.Parser
             _currentMode = HtmlTreeMode.Initial;
             _stopAt = stopAt;
             _ended = false;
+
+            if (maybeOptions.HasValue)
+            {
+                var options = maybeOptions.Value;
+
+                _tokenizer.IsStrictMode = options.IsStrictMode;
+                _tokenizer.IsSupportingProcessingInstructions = options.IsSupportingProcessingInstructions;
+                _tokenizer.IsNotConsumingCharacterReferences = options.IsNotConsumingCharacterReferences;
+                _tokenizer.IsPreservingAttributeNames = options.IsPreservingAttributeNames;
+                _tokenizer.SkipRawText = options.SkipRawText;
+                _tokenizer.SkipScriptText = options.SkipScriptText;
+                _tokenizer.SkipDataText = options.SkipDataText;
+                _tokenizer.ShouldEmitAttribute = options.ShouldEmitAttribute;
+                _tokenizer.SkipDataText = options.SkipDataText;
+                _tokenizer.SkipScriptText = options.SkipScriptText;
+                _tokenizer.SkipRawText = options.SkipRawText;
+                _tokenizer.SkipComments = options.SkipComments;
+                _tokenizer.SkipPlaintext = options.SkipPlaintext;
+                _tokenizer.SkipRCDataText = options.SkipRCDataText;
+                _tokenizer.SkipCDATA = options.SkipCDATA;
+                _tokenizer.SkipProcessingInstructions = options.SkipProcessingInstructions;
+                _tokenizer.DisablePositionTracking = options.DisableElementPositionTracking;
+            }
         }
 
         #endregion
@@ -108,7 +138,7 @@ namespace AngleSharp.Html.Parser
         public async Task<HtmlDocument> ParseAsync(HtmlParserOptions options, CancellationToken cancelToken)
         {
             var source = _document.Source;
-            var token = default(HtmlToken);
+            var token = default(StructHtmlToken);
             SetOptions(options);
 
             do
@@ -120,7 +150,7 @@ namespace AngleSharp.Html.Parser
 
                 cancelToken.ThrowIfCancellationRequested();
                 token = _tokenizer.Get();
-                Consume(token);
+                Consume(ref token);
 
                 if (_waiting != null)
                 {
@@ -137,19 +167,38 @@ namespace AngleSharp.Html.Parser
         /// Parses the given source and creates the document.
         /// </summary>
         /// <param name="options">The options to use for parsing.</param>
-        public HtmlDocument Parse(HtmlParserOptions options)
+        /// <param name="middleware"></param>
+        public HtmlDocument Parse(HtmlParserOptions options, Middleware? middleware = null)
         {
-            var token = default(HtmlToken);
             SetOptions(options);
+            middleware ??= static (ref StructHtmlToken token, Next next) =>
+            {
+                next(ref token);
+                return Result.Continue;
+            };
+
+            var EOF = StructHtmlToken.EndOfFile(default);
+
+            Next consume = this.Consume;
 
             do
             {
-                token = _tokenizer.Get();
-                Consume(token);
-                _waiting?.Wait();
-                _waiting = null;
-            }
-            while (!_ended && token.Type != HtmlTokenType.EndOfFile);
+                ref var token = ref _tokenizer.Get();
+                if (token.Type == HtmlTokenType.EndOfFile)
+                {
+                    Consume(ref token);
+                    break;
+                }
+
+                var result = middleware(ref token, consume);
+
+                if (result == Result.Stop)
+                {
+                    Consume(ref EOF);
+                    break;
+                }
+
+            } while (!_ended);
 
             return _document;
         }
@@ -268,7 +317,7 @@ namespace AngleSharp.Html.Parser
         /// Consumes a token and processes it.
         /// </summary>
         /// <param name="token">The token to consume.</param>
-        private void Consume(HtmlToken token)
+        private void Consume(ref StructHtmlToken  token)
         {
             // static string map(Char c) =>
             //     c switch
@@ -281,12 +330,12 @@ namespace AngleSharp.Html.Parser
             //
             // static string raw(string? input) => input == null ? "null" : $"\"{string.Join("", input.Select(map))}\"";
             //
-            // switch (token)
+            // switch (ref token)
             // {
             //     case HtmlDoctypeToken doctype:
             //         Console.WriteLine($"{doctype.Type} {raw(doctype.Name)} {doctype.Position} {doctype.PublicIdentifier} {doctype.SystemIdentifier} {doctype.GetQuirksMode()} ");
             //         break;
-            //     case HtmlTagToken tag:
+            //     case StructHtmlToken tag:
             //         Console.WriteLine($"{tag.Type} {raw(tag.Name)} {tag.Position} Attrs: {tag.Attributes.Count} ");
             //         break;
             //     default:
@@ -303,11 +352,11 @@ namespace AngleSharp.Html.Parser
                 (((node.Flags & NodeFlags.MathTip) == NodeFlags.MathTip) && token.IsMathCompatible) ||
                 (((node.Flags & NodeFlags.MathMember) == NodeFlags.MathMember) && token.IsSvg && node.LocalName.Is(TagNames.AnnotationXml)))
             {
-                Home(token);
+                Home(ref token);
             }
             else
             {
-                Foreign(token);
+                Foreign(ref token);
             }
         }
 
@@ -317,23 +366,18 @@ namespace AngleSharp.Html.Parser
             _tokenizer.IsSupportingProcessingInstructions = options.IsSupportingProcessingInstructions;
             _tokenizer.IsNotConsumingCharacterReferences = options.IsNotConsumingCharacterReferences;
             _tokenizer.IsPreservingAttributeNames = options.IsPreservingAttributeNames;
-
-            // _tokenizer.SkipRawText = options.SkipRawText;
-            // _tokenizer.SkipScriptText = options.SkipScriptText;
-            // _tokenizer.SkipDataText = options.SkipDataText;
-            //
-            // _tokenizer.SkipDataText = options.SkipDataText;
-            // _tokenizer.SkipScriptText = options.SkipScriptText;
-            // _tokenizer.SkipRawText = options.SkipRawText;
-            // _tokenizer.SkipComments = options.SkipComments;
-            // _tokenizer.SkipPlaintext = options.SkipPlaintext;
-            // _tokenizer.SkipRCDataText = options.SkipRCDataText;
-            // _tokenizer.SkipCDATA = options.SkipCDATA;
-            // _tokenizer.SkipProcessingInstructions = options.SkipProcessingInstructions;
-            //
-            // _tokenizer.ShouldEmitAttribute = options.ShouldEmitAttribute ?? (static (_, _) => true);
-
-
+            _tokenizer.SkipRawText = options.SkipRawText;
+            _tokenizer.SkipScriptText = options.SkipScriptText;
+            _tokenizer.SkipDataText = options.SkipDataText;
+            _tokenizer.SkipScriptText = options.SkipScriptText;
+            _tokenizer.SkipRawText = options.SkipRawText;
+            _tokenizer.SkipComments = options.SkipComments;
+            _tokenizer.SkipPlaintext = options.SkipPlaintext;
+            _tokenizer.SkipRCDataText = options.SkipRCDataText;
+            _tokenizer.SkipCDATA = options.SkipCDATA;
+            _tokenizer.SkipProcessingInstructions = options.SkipProcessingInstructions;
+            _tokenizer.ShouldEmitAttribute = options.ShouldEmitAttribute ?? (static (ref StructHtmlToken _, ReadOnlyMemory<Char> asd) => true);
+            _tokenizer.DisablePositionTracking = options.DisableElementPositionTracking;
 
             _options = options;
         }
@@ -346,96 +390,96 @@ namespace AngleSharp.Html.Parser
         /// Takes the method corresponding to the current insertation mode.
         /// </summary>
         /// <param name="token">The token to insert / use.</param>
-        private void Home(HtmlToken token)
+        private void Home(ref StructHtmlToken  token)
         {
             switch (_currentMode)
             {
                 case HtmlTreeMode.Initial:
-                    Initial(token);
+                    Initial(ref token);
                     return;
 
                 case HtmlTreeMode.BeforeHtml:
-                    BeforeHtml(token);
+                    BeforeHtml(ref token);
                     return;
 
                 case HtmlTreeMode.BeforeHead:
-                    BeforeHead(token);
+                    BeforeHead(ref token);
                     return;
 
                 case HtmlTreeMode.InHead:
-                    InHead(token);
+                    InHead(ref token);
                     return;
 
                 case HtmlTreeMode.InHeadNoScript:
-                    InHeadNoScript(token);
+                    InHeadNoScript(ref token);
                     return;
 
                 case HtmlTreeMode.AfterHead:
-                    AfterHead(token);
+                    AfterHead(ref token);
                     return;
 
                 case HtmlTreeMode.InBody:
-                    InBody(token);
+                    InBody(ref token);
                     return;
 
                 case HtmlTreeMode.Text:
-                    Text(token);
+                    Text(ref token);
                     return;
 
                 case HtmlTreeMode.InTable:
-                    InTable(token);
+                    InTable(ref token);
                     return;
 
                 case HtmlTreeMode.InCaption:
-                    InCaption(token);
+                    InCaption(ref token);
                     return;
 
                 case HtmlTreeMode.InColumnGroup:
-                    InColumnGroup(token);
+                    InColumnGroup(ref token);
                     return;
 
                 case HtmlTreeMode.InTableBody:
-                    InTableBody(token);
+                    InTableBody(ref token);
                     return;
 
                 case HtmlTreeMode.InRow:
-                    InRow(token);
+                    InRow(ref token);
                     return;
 
                 case HtmlTreeMode.InCell:
-                    InCell(token);
+                    InCell(ref token);
                     return;
 
                 case HtmlTreeMode.InSelect:
-                    InSelect(token);
+                    InSelect(ref token);
                     return;
 
                 case HtmlTreeMode.InSelectInTable:
-                    InSelectInTable(token);
+                    InSelectInTable(ref token);
                     return;
 
                 case HtmlTreeMode.InTemplate:
-                    InTemplate(token);
+                    InTemplate(ref token);
                     return;
 
                 case HtmlTreeMode.AfterBody:
-                    AfterBody(token);
+                    AfterBody(ref token);
                     return;
 
                 case HtmlTreeMode.InFrameset:
-                    InFrameset(token);
+                    InFrameset(ref token);
                     return;
 
                 case HtmlTreeMode.AfterFrameset:
-                    AfterFrameset(token);
+                    AfterFrameset(ref token);
                     return;
 
                 case HtmlTreeMode.AfterAfterBody:
-                    AfterAfterBody(token);
+                    AfterAfterBody(ref token);
                     return;
 
                 case HtmlTreeMode.AfterAfterFrameset:
-                    AfterAfterFrameset(token);
+                    AfterAfterFrameset(ref token);
                     return;
             }
         }
@@ -444,26 +488,24 @@ namespace AngleSharp.Html.Parser
         /// See 8.2.5.4.1 The "initial" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void Initial(HtmlToken token)
+        private void Initial(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
                 case HtmlTokenType.Doctype:
                 {
-                    var doctype = (HtmlDoctypeToken)token;
-
-                    if (!doctype.IsValid)
+                    if (!token.IsValid)
                     {
-                        RaiseErrorOccurred(HtmlParseError.DoctypeInvalid, token);
+                        RaiseErrorOccurred(HtmlParseError.DoctypeInvalid, ref token);
                     }
 
-                    _document.AddNode(new DocumentType(_document, doctype.Name ?? String.Empty)
+                    _document.AddNode(new DocumentType(_document, token.Name.String)
                     {
-                        SystemIdentifier = doctype.SystemIdentifier,
-                        PublicIdentifier = doctype.PublicIdentifier
+                        SystemIdentifier = token.SystemIdentifier.String,
+                        PublicIdentifier = token.PublicIdentifier.String
                     });
 
-                    _document.QuirksMode = doctype.GetQuirksMode();
+                    _document.QuirksMode = token.GetQuirksMode();
                     _currentMode = HtmlTreeMode.BeforeHtml;
                     return;
                 }
@@ -480,26 +522,26 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    _document.AddComment(token);
+                    _document.AddComment(ref token);
                     return;
                 }
             }
 
             if (!_options.IsEmbedded)
             {
-                RaiseErrorOccurred(HtmlParseError.DoctypeMissing, token);
+                RaiseErrorOccurred(HtmlParseError.DoctypeMissing, ref token);
                 _document.QuirksMode = QuirksMode.On;
             }
 
             _currentMode = HtmlTreeMode.BeforeHtml;
-            BeforeHtml(token);
+            BeforeHtml(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.2 The "before html" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void BeforeHtml(HtmlToken token)
+        private void BeforeHtml(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -516,7 +558,7 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    _document.AddComment(token);
+                    _document.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -526,36 +568,37 @@ namespace AngleSharp.Html.Parser
                         break;
                     }
 
-                    AddRoot(token.AsTag());
+                    AddRoot(ref token);
                     _currentMode = HtmlTreeMode.BeforeHead;
                     return;
                 }
                 case HtmlTokenType.EndTag:
                 {
-                    if (TagNames.AllBeforeHead.Contains(token.Name))
+                    if (TagNames._mAllBeforeHead.Contains(token.Name))
                     {
                         break;
                     }
 
-                    RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                    RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
             }
 
-            BeforeHtml(HtmlTagToken.Open(TagNames.Html));
-            BeforeHead(token);
+            _temp = StructHtmlToken.Open(TagNames.Html);
+            BeforeHtml(ref _temp);
+            BeforeHead(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.3 The "before head" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void BeforeHead(HtmlToken token)
+        private void BeforeHead(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -576,12 +619,12 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                         return;
                     }
                     else if (tagName.Is(TagNames.Head))
                     {
-                        AddElement(new HtmlHeadElement(_document), token.AsTag());
+                        AddElement(new HtmlHeadElement(_document), ref token);
                         _currentMode = HtmlTreeMode.InHead;
                         return;
                     }
@@ -590,42 +633,42 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.EndTag:
                 {
-                    if (TagNames.AllBeforeHead.Contains(token.Name))
+                    if (TagNames._mAllBeforeHead.Contains(token.Name))
                     {
                         break;
                     }
 
-                    RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                    RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     return;
                 }
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
             }
-
-            BeforeHead(HtmlTagToken.Open(TagNames.Head));
-            InHead(token);
+            _temp = StructHtmlToken.Open(TagNames.Head);
+            BeforeHead(ref _temp);
+            InHead(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.4 The "in head" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InHead(HtmlToken token)
+        private void InHead(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
                 case HtmlTokenType.Character:
                 {
                     var str = token.TrimStart();
-                    AddCharacters(str);
+                    AddCharacters(str.String);
 
                     if (!token.IsEmpty)
                     {
@@ -636,12 +679,12 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -650,13 +693,13 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                         return;
                     }
                     else if (tagName.Is(TagNames.Meta))
                     {
                         var element = new HtmlMetaElement(_document);
-                        AddElement(element, token.AsTag(), acknowledgeSelfClosing: true);
+                        AddElement(element, ref token, acknowledgeSelfClosing: true);
                         CloseCurrentNode();
 
                         try
@@ -671,27 +714,27 @@ namespace AngleSharp.Html.Parser
 
                         return;
                     }
-                    else if (TagNames.AllHeadBase.Contains(tagName))
+                    else if (TagNames._mAllHeadBase.Contains(tagName))
                     {
-                        AddElement(token.AsTag(), acknowledgeSelfClosing: true);
+                        AddElement(ref token, acknowledgeSelfClosing: true);
                         CloseCurrentNode();
                         return;
                     }
                     else if (tagName.Is(TagNames.Title))
                     {
-                        RCDataAlgorithm(token.AsTag());
+                        RCDataAlgorithm(ref token);
                         return;
                     }
                     else if (tagName.Is(TagNames.Style))
                     {
-                        RawtextAlgorithm(token.AsTag());
+                        RawtextAlgorithm(ref token);
                         return;
                     }
                     else if (tagName.Is(TagNames.NoScript))
                     {
                         var scripting = _options.IsScripting;
                         var element = new HtmlNoScriptElement(_document, null, scripting);
-                        AddElement(element, token.AsTag());
+                        AddElement(element, ref token);
 
                         if (scripting)
                         {
@@ -708,12 +751,12 @@ namespace AngleSharp.Html.Parser
                     {
                         if (_options.IsNotSupportingFrames)
                         {
-                            AddElement(token.AsTag());
+                            AddElement(ref token);
                             _currentMode = HtmlTreeMode.InBody;
                         }
                         else
                         {
-                            RawtextAlgorithm(token.AsTag());
+                            RawtextAlgorithm(ref token);
                         }
 
                         return;
@@ -721,7 +764,7 @@ namespace AngleSharp.Html.Parser
                     else if (tagName.Is(TagNames.Script))
                     {
                         var script = new HtmlScriptElement(_document, parserInserted: true, started: IsFragmentCase);
-                        AddElement(script, token.AsTag());
+                        AddElement(script, ref token);
                         _tokenizer.State = HtmlParseMode.Script;
                         _previousMode = _currentMode;
                         _currentMode = HtmlTreeMode.Text;
@@ -729,17 +772,17 @@ namespace AngleSharp.Html.Parser
                     }
                     else if (tagName.Is(TagNames.Head))
                     {
-                        RaiseErrorOccurred(HtmlParseError.HeadTagMisplaced, token);
+                        RaiseErrorOccurred(HtmlParseError.HeadTagMisplaced, ref token);
                         return;
                     }
                     else if (tagName.Is(TagNames.Template))
                     {
-                        AddTemplateElement(token.AsTag());
+                        AddTemplateElement(ref token);
                         return;
                     }
                     else if (IsCustomElementEverywhere(tagName))
                     {
-                        AddElement(token.AsTag());
+                        AddElement(ref token);
                         return;
                     }
 
@@ -765,14 +808,14 @@ namespace AngleSharp.Html.Parser
 
                             if (!CurrentNode.LocalName.Is(TagNames.Template))
                             {
-                                RaiseErrorOccurred(HtmlParseError.TagClosingMismatch, token);
+                                RaiseErrorOccurred(HtmlParseError.TagClosingMismatch, ref token);
                             }
 
                             CloseTemplate();
                         }
                         else
                         {
-                            RaiseErrorOccurred(HtmlParseError.TagInappropriate, token);
+                            RaiseErrorOccurred(HtmlParseError.TagInappropriate, ref token);
                         }
 
                         return;
@@ -785,7 +828,7 @@ namespace AngleSharp.Html.Parser
                     }
                     else if (!tagName.IsOneOf(TagNames.Html, TagNames.Body, TagNames.Br))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                         return;
                     }
 
@@ -795,14 +838,14 @@ namespace AngleSharp.Html.Parser
 
             CloseCurrentNode();
             _currentMode = HtmlTreeMode.AfterHead;
-            AfterHead(token);
+            AfterHead(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.5 The "in head noscript" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InHeadNoScript(HtmlToken token)
+        private void InHeadNoScript(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -820,24 +863,24 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    InHead(token);
+                    InHead(ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
                 {
                     var tagName = token.Name;
 
-                    if (TagNames.AllNoScript.Contains(tagName))
+                    if (TagNames._mAllNoScript.Contains(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else if (tagName.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                     }
                     else if (tagName.IsOneOf(TagNames.Head, TagNames.NoScript))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagInappropriate, token);
+                        RaiseErrorOccurred(HtmlParseError.TagInappropriate, ref token);
                     }
                     else
                     {
@@ -858,7 +901,7 @@ namespace AngleSharp.Html.Parser
                     }
                     else if (!tagName.Is(TagNames.Br))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                         return;
                     }
 
@@ -866,22 +909,22 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
             }
 
-            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
+            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
             CloseCurrentNode();
             _currentMode = HtmlTreeMode.InHead;
-            InHead(token);
+            InHead(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.6 The "after head" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void AfterHead(HtmlToken token)
+        private void AfterHead(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -899,12 +942,12 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -913,29 +956,29 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                     }
                     else if (tagName.Is(TagNames.Body))
                     {
-                        AfterHeadStartTagBody(token.AsTag());
+                        AfterHeadStartTagBody(ref token);
                     }
                     else if (tagName.Is(TagNames.Frameset))
                     {
-                        AddElement(new HtmlFrameSetElement(_document), token.AsTag());
+                        AddElement(new HtmlFrameSetElement(_document), ref token);
                         _currentMode = HtmlTreeMode.InFrameset;
                     }
-                    else if (TagNames.AllHeadNoTemplate.Contains(tagName))
+                    else if (TagNames._mAllHeadNoTemplate.Contains(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagMustBeInHead, token);
+                        RaiseErrorOccurred(HtmlParseError.TagMustBeInHead, ref token);
                         var index = _openElements.Count;
                         var head = _document.Head as Element;
                         _openElements.Add(head!);
-                        InHead(token);
+                        InHead(ref token);
                         CloseNode(head!);
                     }
                     else if (tagName.Is(TagNames.Head))
                     {
-                        RaiseErrorOccurred(HtmlParseError.HeadTagMisplaced, token);
+                        RaiseErrorOccurred(HtmlParseError.HeadTagMisplaced, ref token);
                     }
                     else
                     {
@@ -951,17 +994,18 @@ namespace AngleSharp.Html.Parser
                         break;
                     }
 
-                    RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                    RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     return;
                 }
             }
 
-            AfterHeadStartTagBody(HtmlTagToken.Open(TagNames.Body));
+            _temp = StructHtmlToken.Open(TagNames.Body);
+            AfterHeadStartTagBody(ref _temp);
             _frameset = true;
-            Home(token);
+            Home(ref token);
         }
 
-        private void InBodyStartTag(HtmlTagToken tag)
+        private void InBodyStartTag(ref StructHtmlToken tag)
         {
             var tagName = tag.Name;
 
@@ -969,10 +1013,10 @@ namespace AngleSharp.Html.Parser
             {
                 if (IsInButtonScope())
                 {
-                    InBodyEndTagParagraph(tag);
+                    InBodyEndTagParagraph(ref tag);
                 }
 
-                AddElement(tag);
+                AddElement(ref tag);
             }
             else if (tagName.Is(TagNames.A))
             {
@@ -981,8 +1025,9 @@ namespace AngleSharp.Html.Parser
                     if (_formattingElements[i].LocalName.Is(TagNames.A))
                     {
                         var format = _formattingElements[i];
-                        RaiseErrorOccurred(HtmlParseError.AnchorNested, tag);
-                        HeisenbergAlgorithm(HtmlTagToken.Close(TagNames.A));
+                        RaiseErrorOccurred(HtmlParseError.AnchorNested, ref tag);
+                        _temp = StructHtmlToken.Close(TagNames.A);
+                        HeisenbergAlgorithm(ref _temp);
                         CloseNode(format);
                         _formattingElements.Remove(format);
                         break;
@@ -991,59 +1036,59 @@ namespace AngleSharp.Html.Parser
 
                 ReconstructFormatting();
                 var element = new HtmlAnchorElement(_document);
-                AddElement(element, tag);
+                AddElement(element, ref tag);
                 _formattingElements.AddFormatting(element);
             }
             else if (tagName.Is(TagNames.Span))
             {
                 ReconstructFormatting();
-                AddElement(tag);
+                AddElement(ref tag);
             }
             else if (tagName.Is(TagNames.Li))
             {
-                InBodyStartTagListItem(tag);
+                InBodyStartTagListItem(ref tag);
             }
             else if (tagName.Is(TagNames.Img))
             {
-                InBodyStartTagBreakrow(tag);
+                InBodyStartTagBreakrow(ref tag);
             }
             else if (tagName.IsOneOf(TagNames.Ul, TagNames.P))
             {
                 if (IsInButtonScope())
                 {
-                    InBodyEndTagParagraph(tag);
+                    InBodyEndTagParagraph(ref tag);
                 }
 
-                AddElement(tag);
+                AddElement(ref tag);
             }
-            else if (TagNames.AllSemanticFormatting.Contains(tagName))
+            else if (TagNames._mAllSemanticFormatting.Contains(tagName))
             {
                 ReconstructFormatting();
-                _formattingElements.AddFormatting(AddElement(tag));
+                _formattingElements.AddFormatting(AddElement(ref tag));
             }
             else if (tagName.Is(TagNames.Script))
             {
-                InHead(tag);
+                InHead(ref tag);
             }
-            else if (TagNames.AllHeadings.Contains(tagName))
+            else if (TagNames._mAllHeadings.Contains(tagName))
             {
                 if (IsInButtonScope())
                 {
-                    InBodyEndTagParagraph(tag);
+                    InBodyEndTagParagraph(ref tag);
                 }
 
                 if (TagNames.AllHeadings.Contains(CurrentNode.LocalName))
                 {
-                    RaiseErrorOccurred(HtmlParseError.HeadingNested, tag);
+                    RaiseErrorOccurred(HtmlParseError.HeadingNested, ref tag);
                     CloseCurrentNode();
                 }
 
-                AddElement(new HtmlHeadingElement(_document, tagName), tag);
+                AddElement(new HtmlHeadingElement(_document, tagName.String), ref tag);
             }
             else if (tagName.Is(TagNames.Input))
             {
                 ReconstructFormatting();
-                AddElement(new HtmlInputElement(_document), tag, acknowledgeSelfClosing: true);
+                AddElement(new HtmlInputElement(_document), ref tag, acknowledgeSelfClosing: true);
                 CloseCurrentNode();
 
                 if (!tag.GetAttribute(AttributeNames.Type).Isi(AttributeNames.Hidden))
@@ -1057,43 +1102,43 @@ namespace AngleSharp.Html.Parser
                 {
                     if (IsInButtonScope())
                     {
-                        InBodyEndTagParagraph(tag);
+                        InBodyEndTagParagraph(ref tag);
                     }
 
                     _currentFormElement = new HtmlFormElement(_document);
-                    AddElement(_currentFormElement, tag);
+                    AddElement(_currentFormElement, ref tag);
                 }
                 else
                 {
-                    RaiseErrorOccurred(HtmlParseError.FormAlreadyOpen, tag);
+                    RaiseErrorOccurred(HtmlParseError.FormAlreadyOpen, ref tag);
                 }
             }
-            else if (TagNames.AllBody.Contains(tagName))
+            else if (TagNames._mAllBody.Contains(tagName))
             {
                 if (IsInButtonScope())
                 {
-                    InBodyEndTagParagraph(tag);
+                    InBodyEndTagParagraph(ref tag);
                 }
 
-                AddElement(tag);
+                AddElement(ref tag);
             }
-            else if (TagNames.AllClassicFormatting.Contains(tagName))
+            else if (TagNames._mAllClassicFormatting.Contains(tagName))
             {
                 ReconstructFormatting();
-                _formattingElements.AddFormatting(AddElement(tag));
+                _formattingElements.AddFormatting(AddElement(ref tag));
             }
-            else if (TagNames.AllHead.Contains(tagName))
+            else if (TagNames._mAllHead.Contains(tagName))
             {
-                InHead(tag);
+                InHead(ref tag);
             }
             else if (tagName.IsOneOf(TagNames.Pre, TagNames.Listing))
             {
                 if (IsInButtonScope())
                 {
-                    InBodyEndTagParagraph(tag);
+                    InBodyEndTagParagraph(ref tag);
                 }
 
-                AddElement(tag);
+                AddElement(ref tag);
                 _frameset = false;
                 PreventNewLine();
             }
@@ -1101,14 +1146,14 @@ namespace AngleSharp.Html.Parser
             {
                 if (IsInScope(TagNames.Button))
                 {
-                    RaiseErrorOccurred(HtmlParseError.ButtonInScope, tag);
-                    InBodyEndTagBlock(tag);
-                    InBody(tag);
+                    RaiseErrorOccurred(HtmlParseError.ButtonInScope, ref tag);
+                    InBodyEndTagBlock(ref tag);
+                    InBody(ref tag);
                 }
                 else
                 {
                     ReconstructFormatting();
-                    AddElement(new HtmlButtonElement(_document), tag);
+                    AddElement(new HtmlButtonElement(_document), ref tag);
                     _frameset = false;
                 }
             }
@@ -1116,36 +1161,36 @@ namespace AngleSharp.Html.Parser
             {
                 if (_document.QuirksMode != QuirksMode.On && IsInButtonScope())
                 {
-                    InBodyEndTagParagraph(tag);
+                    InBodyEndTagParagraph(ref tag);
                 }
 
-                AddElement(new HtmlTableElement(_document), tag);
+                AddElement(new HtmlTableElement(_document), ref tag);
                 _frameset = false;
                 _currentMode = HtmlTreeMode.InTable;
             }
-            else if (TagNames.AllBodyBreakrow.Contains(tagName))
+            else if (TagNames._mAllBodyBreakrow.Contains(tagName))
             {
-                InBodyStartTagBreakrow(tag);
+                InBodyStartTagBreakrow(ref tag);
             }
-            else if (TagNames.AllBodyClosed.Contains(tagName))
+            else if (TagNames._mAllBodyClosed.Contains(tagName))
             {
-                AddElement(tag, acknowledgeSelfClosing: true);
+                AddElement(ref tag, acknowledgeSelfClosing: true);
                 CloseCurrentNode();
             }
             else if (tagName.Is(TagNames.Hr))
             {
                 if (IsInButtonScope())
                 {
-                    InBodyEndTagParagraph(tag);
+                    InBodyEndTagParagraph(ref tag);
                 }
 
-                AddElement(new HtmlHrElement(_document), tag, acknowledgeSelfClosing: true);
+                AddElement(new HtmlHrElement(_document), ref tag, acknowledgeSelfClosing: true);
                 CloseCurrentNode();
                 _frameset = false;
             }
             else if (tagName.Is(TagNames.Textarea))
             {
-                AddElement(new HtmlTextAreaElement(_document), tag);
+                AddElement(new HtmlTextAreaElement(_document), ref tag);
                 _tokenizer.State = HtmlParseMode.RCData;
                 _previousMode = _currentMode;
                 _frameset = false;
@@ -1155,7 +1200,7 @@ namespace AngleSharp.Html.Parser
             else if (tagName.Is(TagNames.Select))
             {
                 ReconstructFormatting();
-                AddElement(new HtmlSelectElement(_document), tag);
+                AddElement(new HtmlSelectElement(_document), ref tag);
                 _frameset = false;
 
                 switch (_currentMode)
@@ -1177,33 +1222,34 @@ namespace AngleSharp.Html.Parser
             {
                 if (CurrentNode.LocalName.Is(TagNames.Option))
                 {
-                    InBodyEndTagAnythingElse(HtmlTagToken.Close(TagNames.Option));
+                    _temp = StructHtmlToken.Close(TagNames.Option);
+                    InBodyEndTagAnythingElse(ref _temp);
                 }
 
                 ReconstructFormatting();
-                AddElement(tag);
+                AddElement(ref tag);
             }
             else if (tagName.IsOneOf(TagNames.Dd, TagNames.Dt))
             {
-                InBodyStartTagDefinitionItem(tag);
+                InBodyStartTagDefinitionItem(ref tag);
             }
             else if (tagName.Is(TagNames.Iframe))
             {
                 _frameset = false;
-                RawtextAlgorithm(tag);
+                RawtextAlgorithm(ref tag);
             }
-            else if (TagNames.AllBodyObsolete.Contains(tagName))
+            else if (TagNames._mAllBodyObsolete.Contains(tagName))
             {
                 ReconstructFormatting();
-                AddElement(tag);
+                AddElement(ref tag);
                 _formattingElements.AddScopeMarker();
                 _frameset = false;
             }
             else if (tagName.Is(TagNames.Image))
             {
-                RaiseErrorOccurred(HtmlParseError.ImageTagNamedWrong, tag);
+                RaiseErrorOccurred(HtmlParseError.ImageTagNamedWrong, ref tag);
                 tag.Name = TagNames.Img;
-                InBodyStartTagBreakrow(tag);
+                InBodyStartTagBreakrow(ref tag);
             }
             else if (tagName.Is(TagNames.NoBr))
             {
@@ -1211,23 +1257,23 @@ namespace AngleSharp.Html.Parser
 
                 if (IsInScope(TagNames.NoBr))
                 {
-                    RaiseErrorOccurred(HtmlParseError.NobrInScope, tag);
-                    HeisenbergAlgorithm(tag);
+                    RaiseErrorOccurred(HtmlParseError.NobrInScope, ref tag);
+                    HeisenbergAlgorithm(ref tag);
                     ReconstructFormatting();
                 }
 
-                _formattingElements.AddFormatting(AddElement(tag));
+                _formattingElements.AddFormatting(AddElement(ref tag));
             }
             else if (tagName.Is(TagNames.Xmp))
             {
                 if (IsInButtonScope())
                 {
-                    InBodyEndTagParagraph(tag);
+                    InBodyEndTagParagraph(ref tag);
                 }
 
                 ReconstructFormatting();
                 _frameset = false;
-                RawtextAlgorithm(tag);
+                RawtextAlgorithm(ref tag);
             }
             else if (tagName.IsOneOf(TagNames.Rb, TagNames.Rtc))
             {
@@ -1237,11 +1283,11 @@ namespace AngleSharp.Html.Parser
 
                     if (!CurrentNode.LocalName.Is(TagNames.Ruby))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, tag);
+                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref tag);
                     }
                 }
 
-                AddElement(tag);
+                AddElement(ref tag);
             }
             else if (tagName.IsOneOf(TagNames.Rp, TagNames.Rt))
             {
@@ -1251,15 +1297,15 @@ namespace AngleSharp.Html.Parser
 
                     if (!CurrentNode.LocalName.IsOneOf(TagNames.Ruby, TagNames.Rtc))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, tag);
+                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref tag);
                     }
                 }
 
-                AddElement(tag);
+                AddElement(ref tag);
             }
             else if (tagName.Is(TagNames.NoEmbed))
             {
-                RawtextAlgorithm(tag);
+                RawtextAlgorithm(ref tag);
             }
             else if (tagName.Is(TagNames.NoScript))
             {
@@ -1268,20 +1314,20 @@ namespace AngleSharp.Html.Parser
 
                 if (scripting)
                 {
-                    AddElement(element, tag);
+                    AddElement(element, ref tag);
                     SwitchToRawtext();
                 }
                 else
                 {
                     ReconstructFormatting();
-                    AddElement(element, tag);
+                    AddElement(element, ref tag);
                 }
             }
             else if (tagName.Is(TagNames.Math))
             {
-                var element = new MathElement(_document, tagName);
+                var element = new MathElement(_document, tagName.String);
                 ReconstructFormatting();
-                AddElement(element.Setup(tag));
+                AddElement(element.Setup(ref tag));
 
                 if (tag.IsSelfClosing)
                 {
@@ -1290,9 +1336,9 @@ namespace AngleSharp.Html.Parser
             }
             else if (tagName.Is(TagNames.Svg))
             {
-                var element = new SvgElement(_document, tagName);
+                var element = new SvgElement(_document, tagName.String);
                 ReconstructFormatting();
-                AddElement(element.Setup(tag));
+                AddElement(element.Setup(ref tag));
 
                 if (tag.IsSelfClosing)
                 {
@@ -1303,15 +1349,15 @@ namespace AngleSharp.Html.Parser
             {
                 if (IsInButtonScope())
                 {
-                    InBodyEndTagParagraph(tag);
+                    InBodyEndTagParagraph(ref tag);
                 }
 
-                AddElement(tag);
+                AddElement(ref tag);
                 _tokenizer.State = HtmlParseMode.Plaintext;
             }
             else if (tagName.Is(TagNames.Frameset))
             {
-                RaiseErrorOccurred(HtmlParseError.FramesetMisplaced, tag);
+                RaiseErrorOccurred(HtmlParseError.FramesetMisplaced, ref tag);
 
                 if (_openElements.Count != 1 && _openElements[1].LocalName.Is(TagNames.Body) && _frameset)
                 {
@@ -1322,44 +1368,47 @@ namespace AngleSharp.Html.Parser
                         CloseCurrentNode();
                     }
 
-                    AddElement(new HtmlFrameSetElement(_document), tag);
+                    AddElement(new HtmlFrameSetElement(_document), ref tag);
                     _currentMode = HtmlTreeMode.InFrameset;
                 }
             }
             else if (tagName.Is(TagNames.Html))
             {
-                RaiseErrorOccurred(HtmlParseError.HtmlTagMisplaced, tag);
+                RaiseErrorOccurred(HtmlParseError.HtmlTagMisplaced, ref tag);
 
                 if (_templateModes.Count == 0)
                 {
-                    _openElements[0].SetUniqueAttributes(tag);
+                    _openElements[0].SetUniqueAttributes(ref tag);
                 }
             }
             else if (tagName.Is(TagNames.Body))
             {
-                RaiseErrorOccurred(HtmlParseError.BodyTagMisplaced, tag);
+                RaiseErrorOccurred(HtmlParseError.BodyTagMisplaced, ref tag);
 
                 if (_templateModes.Count == 0 && _openElements.Count > 1 && _openElements[1].LocalName.Is(TagNames.Body))
                 {
                     _frameset = false;
-                    _openElements[1].SetUniqueAttributes(tag);
+                    _openElements[1].SetUniqueAttributes(ref tag);
                 }
             }
             else if (tagName.Is(TagNames.IsIndex))
             {
-                RaiseErrorOccurred(HtmlParseError.TagInappropriate, tag);
+                RaiseErrorOccurred(HtmlParseError.TagInappropriate, ref tag);
 
                 if (_currentFormElement is null)
                 {
-                    InBody(HtmlTagToken.Open(TagNames.Form));
+                    _temp = StructHtmlToken.Open(TagNames.Form);
+                    InBody(ref _temp);
 
                     if (tag.GetAttribute(AttributeNames.Action).Length > 0)
                     {
-                        _currentFormElement!.SetAttribute(AttributeNames.Action, tag.GetAttribute(AttributeNames.Action));
+                        _currentFormElement!.SetAttribute(AttributeNames.Action, tag.GetAttribute(AttributeNames.Action).String);
                     }
 
-                    InBody(HtmlTagToken.Open(TagNames.Hr));
-                    InBody(HtmlTagToken.Open(TagNames.Label));
+                    _temp = StructHtmlToken.Open(TagNames.Hr);
+                    InBody(ref _temp);
+                    _temp = StructHtmlToken.Open(TagNames.Label);
+                    InBody(ref _temp);
 
                     if (tag.GetAttribute(AttributeNames.Prompt).Length > 0)
                     {
@@ -1370,7 +1419,7 @@ namespace AngleSharp.Html.Parser
                         AddCharacters("This is a searchable index. Enter search keywords: ");
                     }
 
-                    var input = HtmlTagToken.Open(TagNames.Input);
+                    var input = StructHtmlToken.Open(TagNames.Input);
                     input.AddAttribute(AttributeNames.Name, TagNames.IsIndex);
 
                     for (var i = 0; i < tag.Attributes.Count; i++)
@@ -1379,38 +1428,42 @@ namespace AngleSharp.Html.Parser
 
                         if (!attr.Name.IsOneOf(AttributeNames.Name, AttributeNames.Action, AttributeNames.Prompt))
                         {
-                            input.AddAttribute(attr.Name, attr.Value);
+                            input.AddAttribute(attr.Name.String, attr.Value.String);
                         }
                     }
 
-                    InBody(input);
-                    InBody(HtmlTagToken.Close(TagNames.Label));
-                    InBody(HtmlTagToken.Open(TagNames.Hr));
-                    InBody(HtmlTagToken.Close(TagNames.Form));
+                    InBody(ref input);
+
+                    _temp = StructHtmlToken.Close(TagNames.Label);
+                    InBody(ref _temp);
+                    _temp = StructHtmlToken.Open(TagNames.Hr);
+                    InBody(ref _temp);
+                    _temp = StructHtmlToken.Close(TagNames.Form);
+                    InBody(ref _temp);
                 }
             }
-            else if (TagNames.AllNested.Contains(tagName))
+            else if (TagNames._mAllNested.Contains(tagName))
             {
-                RaiseErrorOccurred(HtmlParseError.TagCannotStartHere, tag);
+                RaiseErrorOccurred(HtmlParseError.TagCannotStartHere, ref tag);
             }
             else
             {
                 ReconstructFormatting();
-                AddElement(tag);
+                AddElement(ref tag);
             }
         }
 
-        private void InBodyEndTag(HtmlTagToken tag)
+        private void InBodyEndTag(ref StructHtmlToken tag)
         {
             var tagName = tag.Name;
 
             if (tagName.Is(TagNames.Div))
             {
-                InBodyEndTagBlock(tag);
+                InBodyEndTagBlock(ref tag);
             }
             else if (tagName.Is(TagNames.A))
             {
-                HeisenbergAlgorithm(tag);
+                HeisenbergAlgorithm(ref tag);
             }
             else if (tagName.Is(TagNames.Li))
             {
@@ -1420,7 +1473,7 @@ namespace AngleSharp.Html.Parser
 
                     if (!CurrentNode.LocalName.Is(TagNames.Li))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, tag);
+                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref tag);
                     }
 
                     ClearStackBackTo(TagNames.Li);
@@ -1428,20 +1481,20 @@ namespace AngleSharp.Html.Parser
                 }
                 else
                 {
-                    RaiseErrorOccurred(HtmlParseError.ListItemNotInScope, tag);
+                    RaiseErrorOccurred(HtmlParseError.ListItemNotInScope, ref tag);
                 }
             }
             else if (tagName.Is(TagNames.P))
             {
-                InBodyEndTagParagraph(tag);
+                InBodyEndTagParagraph(ref tag);
             }
-            else if (TagNames.AllBlocks.Contains(tagName))
+            else if (TagNames._mAllBlocks.Contains(tagName))
             {
-                InBodyEndTagBlock(tag);
+                InBodyEndTagBlock(ref tag);
             }
-            else if (TagNames.AllFormatting.Contains(tagName))
+            else if (TagNames._mAllFormatting.Contains(tagName))
             {
-                HeisenbergAlgorithm(tag);
+                HeisenbergAlgorithm(ref tag);
             }
             else if (tagName.Is(TagNames.Form))
             {
@@ -1454,22 +1507,23 @@ namespace AngleSharp.Html.Parser
 
                     if (CurrentNode != node)
                     {
-                        RaiseErrorOccurred(HtmlParseError.FormClosedWrong, tag);
+                        RaiseErrorOccurred(HtmlParseError.FormClosedWrong, ref tag);
                     }
 
                     CloseNode(node);
                 }
                 else
                 {
-                    RaiseErrorOccurred(HtmlParseError.FormNotInScope, tag);
+                    RaiseErrorOccurred(HtmlParseError.FormNotInScope, ref tag);
                 }
             }
             else if (tagName.Is(TagNames.Br))
             {
-                RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, tag);
-                Consume(HtmlTagToken.Open(TagNames.Br));
+                RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref tag);
+                _temp = StructHtmlToken.Open(TagNames.Br);
+                Consume(ref _temp);
             }
-            else if (TagNames.AllHeadings.Contains(tagName))
+            else if (TagNames._mAllHeadings.Contains(tagName))
             {
                 if (IsInScope(TagNames.AllHeadings))
                 {
@@ -1477,7 +1531,7 @@ namespace AngleSharp.Html.Parser
 
                     if (!CurrentNode.LocalName.Is(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, tag);
+                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref tag);
                     }
 
                     ClearStackBackTo(TagNames.AllHeadings);
@@ -1485,7 +1539,7 @@ namespace AngleSharp.Html.Parser
                 }
                 else
                 {
-                    RaiseErrorOccurred(HtmlParseError.HeadingNotInScope, tag);
+                    RaiseErrorOccurred(HtmlParseError.HeadingNotInScope, ref tag);
                 }
             }
             else if (tagName.IsOneOf(TagNames.Dd, TagNames.Dt))
@@ -1496,7 +1550,7 @@ namespace AngleSharp.Html.Parser
 
                     if (!CurrentNode.LocalName.Is(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, tag);
+                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref tag);
                     }
 
                     ClearStackBackTo(tagName);
@@ -1504,7 +1558,7 @@ namespace AngleSharp.Html.Parser
                 }
                 else
                 {
-                    RaiseErrorOccurred(HtmlParseError.ListItemNotInScope, tag);
+                    RaiseErrorOccurred(HtmlParseError.ListItemNotInScope, ref tag);
                 }
             }
             else if (tagName.IsOneOf(TagNames.Applet, TagNames.Marquee, TagNames.Object))
@@ -1515,7 +1569,7 @@ namespace AngleSharp.Html.Parser
 
                     if (!CurrentNode.LocalName.Is(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, tag);
+                        RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref tag);
                     }
 
                     ClearStackBackTo(tagName);
@@ -1524,27 +1578,27 @@ namespace AngleSharp.Html.Parser
                 }
                 else
                 {
-                    RaiseErrorOccurred(HtmlParseError.ObjectNotInScope, tag);
+                    RaiseErrorOccurred(HtmlParseError.ObjectNotInScope, ref tag);
                 }
             }
             else if (tagName.Is(TagNames.Body))
             {
-                InBodyEndTagBody(tag);
+                InBodyEndTagBody(ref tag);
             }
             else if (tagName.Is(TagNames.Html))
             {
-                if (InBodyEndTagBody(tag))
+                if (InBodyEndTagBody(ref tag))
                 {
-                    AfterBody(tag);
+                    AfterBody(ref tag);
                 }
             }
             else if (tagName.Is(TagNames.Template))
             {
-                InHead(tag);
+                InHead(ref tag);
             }
             else
             {
-                InBodyEndTagAnythingElse(tag);
+                InBodyEndTagAnythingElse(ref tag);
             }
         }
 
@@ -1552,7 +1606,7 @@ namespace AngleSharp.Html.Parser
         /// See 8.2.5.4.7 The "in body" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InBody(HtmlToken token)
+        private void InBody(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -1565,31 +1619,31 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.StartTag:
                 {
-                    InBodyStartTag(token.AsTag());
+                    InBodyStartTag(ref token);
                     return;
                 }
                 case HtmlTokenType.EndTag:
                 {
-                    InBodyEndTag(token.AsTag());
+                    InBodyEndTag(ref token);
                     return;
                 }
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
                 case HtmlTokenType.EndOfFile:
                 {
-                    CheckBodyOnClosing(token);
+                    CheckBodyOnClosing(ref token);
 
                     if (_templateModes.Count != 0)
                     {
-                        InTemplate(token);
+                        InTemplate(ref token);
                     }
                     else
                     {
@@ -1605,7 +1659,7 @@ namespace AngleSharp.Html.Parser
         /// See 8.2.5.4.8 The "text" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void Text(HtmlToken token)
+        private void Text(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -1630,10 +1684,10 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.EndOfFile:
                 {
-                    RaiseErrorOccurred(HtmlParseError.EOF, token);
+                    RaiseErrorOccurred(HtmlParseError.EOF, ref token);
                     CloseCurrentNode();
                     _currentMode = _previousMode;
-                    Consume(token);
+                    Consume(ref token);
                     return;
                 }
             }
@@ -1643,18 +1697,18 @@ namespace AngleSharp.Html.Parser
         /// See 8.2.5.4.9 The "in table" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InTable(HtmlToken token)
+        private void InTable(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -1665,79 +1719,81 @@ namespace AngleSharp.Html.Parser
                     {
                         ClearStackBackTo(TagNames.Table);
                         _formattingElements.AddScopeMarker();
-                        AddElement(new HtmlTableCaptionElement(_document), token.AsTag());
+                        AddElement(new HtmlTableCaptionElement(_document), ref token);
                         _currentMode = HtmlTreeMode.InCaption;
                     }
                     else if (tagName.Is(TagNames.Colgroup))
                     {
                         ClearStackBackTo(TagNames.Table);
-                        AddElement(new HtmlTableColgroupElement(_document), token.AsTag());
+                        AddElement(new HtmlTableColgroupElement(_document), ref token);
                         _currentMode = HtmlTreeMode.InColumnGroup;
                     }
                     else if (tagName.Is(TagNames.Col))
                     {
-                        InTable(HtmlTagToken.Open(TagNames.Colgroup));
-                        InColumnGroup(token);
+                        _temp = StructHtmlToken.Open(TagNames.Colgroup);
+                        InTable(ref _temp);
+                        InColumnGroup(ref token);
                     }
-                    else if (TagNames.AllTableSections.Contains(tagName))
+                    else if (TagNames.AllTableSections.Contains(tagName.String))
                     {
                         ClearStackBackTo(TagNames.Table);
-                        AddElement(new HtmlTableSectionElement(_document, tagName), token.AsTag());
+                        AddElement(new HtmlTableSectionElement(_document, tagName.String), ref token);
                         _currentMode = HtmlTreeMode.InTableBody;
                     }
-                    else if (TagNames.AllTableCellsRows.Contains(tagName))
+                    else if (TagNames._mAllTableCellsRows.Contains(tagName))
                     {
-                        InTable(HtmlTagToken.Open(TagNames.Tbody));
-                        InTableBody(token);
+                        _temp = StructHtmlToken.Open(TagNames.Tbody);
+                        InTable(ref _temp);
+                        InTableBody(ref token);
                     }
                     else if (tagName.Is(TagNames.Table))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TableNesting, token);
+                        RaiseErrorOccurred(HtmlParseError.TableNesting, ref token);
 
-                        if (InTableEndTagTable(token))
+                        if (InTableEndTagTable(ref token))
                         {
-                            Home(token);
+                            Home(ref token);
                         }
                     }
                     else if (tagName.Is(TagNames.Input))
                     {
-                        var tag = token.AsTag();
+                        var tag = token;
 
                         if (tag.GetAttribute(AttributeNames.Type).Isi(AttributeNames.Hidden))
                         {
-                            RaiseErrorOccurred(HtmlParseError.InputUnexpected, token);
-                            AddElement(new HtmlInputElement(_document), tag, true);
+                            RaiseErrorOccurred(HtmlParseError.InputUnexpected, ref token);
+                            AddElement(new HtmlInputElement(_document), ref tag, true);
                             CloseCurrentNode();
                         }
                         else
                         {
-                            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
-                            InBodyWithFoster(token);
+                            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
+                            InBodyWithFoster(ref token);
                         }
                     }
                     else if (tagName.Is(TagNames.Form))
                     {
-                        RaiseErrorOccurred(HtmlParseError.FormInappropriate, token);
+                        RaiseErrorOccurred(HtmlParseError.FormInappropriate, ref token);
 
                         if (_currentFormElement is null)
                         {
                             _currentFormElement = new HtmlFormElement(_document);
-                            AddElement(_currentFormElement, token.AsTag());
+                            AddElement(_currentFormElement, ref token);
                             CloseCurrentNode();
                         }
                     }
-                    else if (TagNames.AllTableHead.Contains(tagName))
+                    else if (TagNames._mAllTableHead.Contains(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else if (IsCustomElementEverywhere(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
-                        RaiseErrorOccurred(HtmlParseError.IllegalElementInTableDetected, token);
-                        InBodyWithFoster(token);
+                        RaiseErrorOccurred(HtmlParseError.IllegalElementInTableDetected, ref token);
+                        InBodyWithFoster(ref token);
                     }
 
                     return;
@@ -1748,38 +1804,38 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Table))
                     {
-                        InTableEndTagTable(token);
+                        InTableEndTagTable(ref token);
                     }
                     else if (tagName.Is(TagNames.Template))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
-                    else if (TagNames.AllTableSpecial.Contains(tagName) || TagNames.AllTableInner.Contains(tagName))
+                    else if (TagNames._mAllTableSpecial.Contains(tagName) || TagNames._mAllTableInner.Contains(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     }
                     else if (IsCustomElementEverywhere(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
-                        RaiseErrorOccurred(HtmlParseError.IllegalElementInTableDetected, token);
-                        InBodyWithFoster(token);
+                        RaiseErrorOccurred(HtmlParseError.IllegalElementInTableDetected, ref token);
+                        InBodyWithFoster(ref token);
                     }
 
                     return;
                 }
                 case HtmlTokenType.EndOfFile:
                 {
-                    InBody(token);
+                    InBody(ref token);
                     return;
                 }
                 case HtmlTokenType.Character:
                 {
                     if (TagNames.AllTableMajor.Contains(CurrentNode.LocalName))
                     {
-                        InTableText(token);
+                        InTableText(ref token);
                         return;
                     }
 
@@ -1787,20 +1843,20 @@ namespace AngleSharp.Html.Parser
                 }
             }
 
-            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
-            InBodyWithFoster(token);
+            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
+            InBodyWithFoster(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.10 The "in table text" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InTableText(HtmlToken token)
+        private void InTableText(ref StructHtmlToken token)
         {
             if (token.HasContent)
             {
-                RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
-                InBodyWithFoster(token);
+                RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
+                InBodyWithFoster(ref token);
             }
             else
             {
@@ -1812,7 +1868,7 @@ namespace AngleSharp.Html.Parser
         /// See 8.2.5.4.11 The "in caption" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InCaption(HtmlToken token)
+        private void InCaption(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -1822,24 +1878,24 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Caption))
                     {
-                        InCaptionEndTagCaption(token);
+                        InCaptionEndTagCaption(ref token);
                     }
-                    else if (TagNames.AllCaptionStart.Contains(tagName))
+                    else if (TagNames._mAllCaptionStart.Contains(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     }
                     else if (tagName.Is(TagNames.Table))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TableNesting, token);
+                        RaiseErrorOccurred(HtmlParseError.TableNesting, ref token);
 
-                        if (InCaptionEndTagCaption(token))
+                        if (InCaptionEndTagCaption(ref token))
                         {
-                            InTable(token);
+                            InTable(ref token);
                         }
                     }
                     else if (IsCustomElementEverywhere(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
@@ -1852,18 +1908,18 @@ namespace AngleSharp.Html.Parser
                 {
                     var tagName = token.Name;
 
-                    if (TagNames.AllCaptionEnd.Contains(tagName))
+                    if (TagNames._mAllCaptionEnd.Contains(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotStartHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotStartHere, ref token);
 
-                        if (InCaptionEndTagCaption(token))
+                        if (InCaptionEndTagCaption(ref token))
                         {
-                            InTable(token);
+                            InTable(ref token);
                         }
                     }
                     else if (IsCustomElementEverywhere(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
@@ -1874,14 +1930,14 @@ namespace AngleSharp.Html.Parser
                 }
             }
 
-            InBody(token);
+            InBody(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.12 The "in column group" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InColumnGroup(HtmlToken token)
+        private void InColumnGroup(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -1899,12 +1955,12 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -1913,16 +1969,16 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                     }
                     else if (tagName.Is(TagNames.Col))
                     {
-                        AddElement(new HtmlTableColElement(_document), token.AsTag(), acknowledgeSelfClosing: true);
+                        AddElement(new HtmlTableColElement(_document), ref token, acknowledgeSelfClosing: true);
                         CloseCurrentNode();
                     }
                     else if (tagName.Is(TagNames.Template) || IsCustomElementEverywhere(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
@@ -1937,15 +1993,15 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Colgroup))
                     {
-                        InColumnGroupEndTagColgroup(token);
+                        InColumnGroupEndTagColgroup(ref token);
                     }
                     else if (tagName.Is(TagNames.Col))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagClosedWrong, token);
+                        RaiseErrorOccurred(HtmlParseError.TagClosedWrong, ref token);
                     }
                     else if (tagName.Is(TagNames.Template) || IsCustomElementEverywhere(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
@@ -1956,14 +2012,14 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.EndOfFile:
                 {
-                    InBody(token);
+                    InBody(ref token);
                     return;
                 }
             }
 
-            if (InColumnGroupEndTagColgroup(token))
+            if (InColumnGroupEndTagColgroup(ref token))
             {
-                InTable(token);
+                InTable(ref token);
             }
         }
 
@@ -1971,7 +2027,7 @@ namespace AngleSharp.Html.Parser
         /// See 8.2.5.4.13 The "in table body" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InTableBody(HtmlToken token)
+        private void InTableBody(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -1982,17 +2038,18 @@ namespace AngleSharp.Html.Parser
                     if (tagName.Is(TagNames.Tr))
                     {
                         ClearStackBackTo(TagNames.AllTableSections);
-                        AddElement(new HtmlTableRowElement(_document), token.AsTag());
+                        AddElement(new HtmlTableRowElement(_document), ref token);
                         _currentMode = HtmlTreeMode.InRow;
                     }
-                    else if (TagNames.AllTableCells.Contains(tagName))
+                    else if (TagNames._mAllTableCells.Contains(tagName))
                     {
-                        InTableBody(HtmlTagToken.Open(TagNames.Tr));
-                        InRow(token);
+                        _temp = StructHtmlToken.Open(TagNames.Tr);
+                        InTableBody(ref _temp);
+                        InRow(ref token);
                     }
-                    else if (TagNames.AllTableGeneral.Contains(tagName))
+                    else if (TagNames._mAllTableGeneral.Contains(tagName))
                     {
-                        InTableBodyCloseTable(token.AsTag());
+                        InTableBodyCloseTable(ref token);
                     }
                     else
                     {
@@ -2005,7 +2062,7 @@ namespace AngleSharp.Html.Parser
                 {
                     var tagName = token.Name;
 
-                    if (TagNames.AllTableSections.Contains(tagName))
+                    if (TagNames._mAllTableSections.Contains(tagName))
                     {
                         if (IsInTableScope(tagName))
                         {
@@ -2015,16 +2072,16 @@ namespace AngleSharp.Html.Parser
                         }
                         else
                         {
-                            RaiseErrorOccurred(HtmlParseError.TableSectionNotInScope, token);
+                            RaiseErrorOccurred(HtmlParseError.TableSectionNotInScope, ref token);
                         }
                     }
-                    else if (tagName.Is(TagNames.Tr) || TagNames.AllTableSpecial.Contains(tagName))
+                    else if (tagName.Is(TagNames.Tr) || TagNames._mAllTableSpecial.Contains(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     }
                     else if (tagName.Is(TagNames.Table))
                     {
-                        InTableBodyCloseTable(token.AsTag());
+                        InTableBodyCloseTable(ref token);
                     }
                     else
                     {
@@ -2035,14 +2092,14 @@ namespace AngleSharp.Html.Parser
                 }
             }
 
-            InTable(token);
+            InTable(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.14 The "in row" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InRow(HtmlToken token)
+        private void InRow(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -2050,18 +2107,18 @@ namespace AngleSharp.Html.Parser
                 {
                     var tagName = token.Name;
 
-                    if (TagNames.AllTableCells.Contains(tagName))
+                    if (TagNames._mAllTableCells.Contains(tagName))
                     {
                         ClearStackBackTo(TagNames.Tr);
-                        AddElement(token.AsTag());
+                        AddElement(ref token);
                         _currentMode = HtmlTreeMode.InCell;
                         _formattingElements.AddScopeMarker();
                     }
-                    else if (tagName.Is(TagNames.Tr) || TagNames.AllTableGeneral.Contains(tagName))
+                    else if (tagName.Is(TagNames.Tr) || TagNames._mAllTableGeneral.Contains(tagName))
                     {
-                        if (InRowEndTagTablerow(token))
+                        if (InRowEndTagTablerow(ref token))
                         {
-                            InTableBody(token);
+                            InTableBody(ref token);
                         }
                     }
                     else
@@ -2077,30 +2134,30 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Tr))
                     {
-                        InRowEndTagTablerow(token);
+                        InRowEndTagTablerow(ref token);
                     }
                     else if (tagName.Is(TagNames.Table))
                     {
-                        if (InRowEndTagTablerow(token))
+                        if (InRowEndTagTablerow(ref token))
                         {
-                            InTableBody(token);
+                            InTableBody(ref token);
                         }
                     }
-                    else if (TagNames.AllTableSections.Contains(tagName))
+                    else if (TagNames._mAllTableSections.Contains(tagName))
                     {
                         if (IsInTableScope(tagName))
                         {
-                            InRowEndTagTablerow(token);
-                            InTableBody(token);
+                            InRowEndTagTablerow(ref token);
+                            InTableBody(ref token);
                         }
                         else
                         {
-                            RaiseErrorOccurred(HtmlParseError.TableSectionNotInScope, token);
+                            RaiseErrorOccurred(HtmlParseError.TableSectionNotInScope, ref token);
                         }
                     }
-                    else if (TagNames.AllTableSpecial.Contains(tagName))
+                    else if (TagNames._mAllTableSpecial.Contains(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     }
                     else
                     {
@@ -2111,14 +2168,14 @@ namespace AngleSharp.Html.Parser
                 }
             }
 
-            InTable(token);
+            InTable(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.15 The "in cell" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InCell(HtmlToken token)
+        private void InCell(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -2126,16 +2183,16 @@ namespace AngleSharp.Html.Parser
                 {
                     var tagName = token.Name;
 
-                    if (TagNames.AllTableCellsRows.Contains(tagName) || TagNames.AllTableGeneral.Contains(tagName))
+                    if (TagNames._mAllTableCellsRows.Contains(tagName) || TagNames._mAllTableGeneral.Contains(tagName))
                     {
                         if (IsInTableScope(TagNames.AllTableCells))
                         {
-                            InCellEndTagCell(token);
-                            Home(token);
+                            InCellEndTagCell(ref token);
+                            Home(ref token);
                         }
                         else
                         {
-                            RaiseErrorOccurred(HtmlParseError.TableCellNotInScope, token);
+                            RaiseErrorOccurred(HtmlParseError.TableCellNotInScope, ref token);
                         }
 
                         return;
@@ -2147,43 +2204,43 @@ namespace AngleSharp.Html.Parser
                 {
                     var tagName = token.Name;
 
-                    if (TagNames.AllTableCells.Contains(tagName))
+                    if (TagNames._mAllTableCells.Contains(tagName))
                     {
-                        InCellEndTagCell(token);
+                        InCellEndTagCell(ref token);
                     }
-                    else if (TagNames.AllTableCore.Contains(tagName))
+                    else if (TagNames._mAllTableCore.Contains(tagName))
                     {
                         if (IsInTableScope(tagName))
                         {
-                            InCellEndTagCell(token);
-                            Home(token);
+                            InCellEndTagCell(ref token);
+                            Home(ref token);
                         }
                         else
                         {
-                            RaiseErrorOccurred(HtmlParseError.TableNotInScope, token);
+                            RaiseErrorOccurred(HtmlParseError.TableNotInScope, ref token);
                         }
                     }
-                    else if (!TagNames.AllTableSpecial.Contains(tagName))
+                    else if (!TagNames._mAllTableSpecial.Contains(tagName))
                     {
-                        InBody(token);
+                        InBody(ref token);
                     }
                     else
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     }
 
                     return;
                 }
             }
 
-            InBody(token);
+            InBody(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.16 The "in select" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InSelect(HtmlToken token)
+        private void InSelect(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -2194,12 +2251,12 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -2208,53 +2265,53 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                     }
                     else if (tagName.Is(TagNames.Option))
                     {
                         if (CurrentNode.LocalName.Is(TagNames.Option))
                         {
-                            InSelectEndTagOption(token);
+                            InSelectEndTagOption(ref token);
                         }
 
-                        AddElement(new HtmlOptionElement(_document), token.AsTag());
+                        AddElement(new HtmlOptionElement(_document), ref token);
                     }
                     else if (tagName.Is(TagNames.Optgroup))
                     {
                         if (CurrentNode.LocalName.Is(TagNames.Option))
                         {
-                            InSelectEndTagOption(token);
+                            InSelectEndTagOption(ref token);
                         }
 
                         if (CurrentNode.LocalName.Is(TagNames.Optgroup))
                         {
-                            InSelectEndTagOptgroup(token);
+                            InSelectEndTagOptgroup(ref token);
                         }
 
-                        AddElement(new HtmlOptionsGroupElement(_document), token.AsTag());
+                        AddElement(new HtmlOptionsGroupElement(_document), ref token);
                     }
                     else if (tagName.Is(TagNames.Select))
                     {
-                        RaiseErrorOccurred(HtmlParseError.SelectNesting, token);
+                        RaiseErrorOccurred(HtmlParseError.SelectNesting, ref token);
                         InSelectEndTagSelect();
                     }
-                    else if (TagNames.AllInput.Contains(tagName))
+                    else if (TagNames._mAllInput.Contains(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.IllegalElementInSelectDetected, token);
+                        RaiseErrorOccurred(HtmlParseError.IllegalElementInSelectDetected, ref token);
 
                         if (IsInSelectScope(TagNames.Select))
                         {
                             InSelectEndTagSelect();
-                            Home(token);
+                            Home(ref token);
                         }
                     }
                     else if (tagName.IsOneOf(TagNames.Template, TagNames.Script) || IsCustomElementEverywhere(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
-                        RaiseErrorOccurred(HtmlParseError.IllegalElementInSelectDetected, token);
+                        RaiseErrorOccurred(HtmlParseError.IllegalElementInSelectDetected, ref token);
                     }
 
                     return;
@@ -2265,15 +2322,15 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Template) || IsCustomElementEverywhere(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else if (tagName.Is(TagNames.Optgroup))
                     {
-                        InSelectEndTagOptgroup(token);
+                        InSelectEndTagOptgroup(ref token);
                     }
                     else if (tagName.Is(TagNames.Option))
                     {
-                        InSelectEndTagOption(token);
+                        InSelectEndTagOption(ref token);
                     }
                     else if (tagName.Is(TagNames.Select) && IsInSelectScope(TagNames.Select))
                     {
@@ -2281,23 +2338,23 @@ namespace AngleSharp.Html.Parser
                     }
                     else if (tagName.Is(TagNames.Select))
                     {
-                        RaiseErrorOccurred(HtmlParseError.SelectNotInScope, token);
+                        RaiseErrorOccurred(HtmlParseError.SelectNotInScope, ref token);
                     }
                     else
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     }
 
                     return;
                 }
                 case HtmlTokenType.EndOfFile:
                 {
-                    InBody(token);
+                    InBody(ref token);
                     return;
                 }
                 default:
                 {
-                    RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
+                    RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
                     return;
                 }
             }
@@ -2307,7 +2364,7 @@ namespace AngleSharp.Html.Parser
         /// See 8.2.5.4.17 The "in select in table" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InSelectInTable(HtmlToken token)
+        private void InSelectInTable(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -2315,11 +2372,11 @@ namespace AngleSharp.Html.Parser
                 {
                     var tagName = token.Name;
 
-                    if (TagNames.AllTableSelects.Contains(tagName))
+                    if (TagNames._mAllTableSelects.Contains(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.IllegalElementInSelectDetected, token);
+                        RaiseErrorOccurred(HtmlParseError.IllegalElementInSelectDetected, ref token);
                         InSelectEndTagSelect();
-                        Home(token);
+                        Home(ref token);
                         return;
                     }
 
@@ -2329,14 +2386,14 @@ namespace AngleSharp.Html.Parser
                 {
                     var tagName = token.Name;
 
-                    if (TagNames.AllTableSelects.Contains(tagName))
+                    if (TagNames._mAllTableSelects.Contains(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
 
                         if (IsInTableScope(tagName))
                         {
                             InSelectEndTagSelect();
-                            Home(token);
+                            Home(ref token);
                         }
 
                         return;
@@ -2346,14 +2403,14 @@ namespace AngleSharp.Html.Parser
                 }
             }
 
-            InSelect(token);
+            InSelect(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.18 The "in template" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InTemplate(HtmlToken token)
+        private void InTemplate(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -2361,29 +2418,29 @@ namespace AngleSharp.Html.Parser
                 {
                     var tagName = token.Name;
 
-                    if (tagName.Is(TagNames.Script) || TagNames.AllHead.Contains(tagName))
+                    if (tagName.Is(TagNames.Script) || TagNames._mAllHead.Contains(tagName))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
-                    else if (TagNames.AllTableRoot.Contains(tagName))
+                    else if (TagNames._mAllTableRoot.Contains(tagName))
                     {
-                        TemplateStep(token, HtmlTreeMode.InTable);
+                        TemplateStep(ref token, HtmlTreeMode.InTable);
                     }
                     else if (tagName.Is(TagNames.Col))
                     {
-                        TemplateStep(token, HtmlTreeMode.InColumnGroup);
+                        TemplateStep(ref token, HtmlTreeMode.InColumnGroup);
                     }
                     else if (tagName.Is(TagNames.Tr))
                     {
-                        TemplateStep(token, HtmlTreeMode.InTableBody);
+                        TemplateStep(ref token, HtmlTreeMode.InTableBody);
                     }
-                    else if (TagNames.AllTableCells.Contains(tagName))
+                    else if (TagNames._mAllTableCells.Contains(tagName))
                     {
-                        TemplateStep(token, HtmlTreeMode.InRow);
+                        TemplateStep(ref token, HtmlTreeMode.InRow);
                     }
                     else
                     {
-                        TemplateStep(token, HtmlTreeMode.InBody);
+                        TemplateStep(ref token, HtmlTreeMode.InBody);
                     }
 
                     return;
@@ -2392,11 +2449,11 @@ namespace AngleSharp.Html.Parser
                 {
                     if (token.Name.Is(TagNames.Template))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, token);
+                        RaiseErrorOccurred(HtmlParseError.TagCannotEndHere, ref token);
                     }
 
                     return;
@@ -2405,9 +2462,9 @@ namespace AngleSharp.Html.Parser
                 {
                     if (TagCurrentlyOpen(TagNames.Template))
                     {
-                        RaiseErrorOccurred(HtmlParseError.EOF, token);
+                        RaiseErrorOccurred(HtmlParseError.EOF, ref token);
                         CloseTemplate();
-                        Home(token);
+                        Home(ref token);
                         return;
                     }
 
@@ -2416,7 +2473,7 @@ namespace AngleSharp.Html.Parser
                 }
                 default:
                 {
-                    InBody(token);
+                    InBody(ref token);
                     return;
                 }
             }
@@ -2426,7 +2483,7 @@ namespace AngleSharp.Html.Parser
         /// See 8.2.5.4.19 The "after body" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void AfterBody(HtmlToken token)
+        private void AfterBody(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -2445,19 +2502,19 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    _openElements[0].AddComment(token);
+                    _openElements[0].AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
                 {
                     if (token.Name.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                         return;
                     }
 
@@ -2469,7 +2526,7 @@ namespace AngleSharp.Html.Parser
                     {
                         if (IsFragmentCase)
                         {
-                            RaiseErrorOccurred(HtmlParseError.TagInvalidInFragmentMode, token);
+                            RaiseErrorOccurred(HtmlParseError.TagInvalidInFragmentMode, ref token);
                         }
                         else
                         {
@@ -2488,16 +2545,16 @@ namespace AngleSharp.Html.Parser
                 }
             }
 
-            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
+            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
             _currentMode = HtmlTreeMode.InBody;
-            InBody(token);
+            InBody(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.20 The "in frameset" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void InFrameset(HtmlToken token)
+        private void InFrameset(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -2515,12 +2572,12 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -2529,28 +2586,28 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                     }
                     else if (tagName.Is(TagNames.Frameset))
                     {
-                        AddElement(new HtmlFrameSetElement(_document), token.AsTag());
+                        AddElement(new HtmlFrameSetElement(_document), ref token);
                     }
                     else if (tagName.Is(TagNames.Frame))
                     {
                         if (_options.IsNotSupportingFrames)
                         {
-                            AddElement(new HtmlUnknownElement(_document, tagName), token.AsTag());
+                            AddElement(new HtmlUnknownElement(_document, tagName.String), ref token);
                         }
                         else
                         {
-                            AddElement(new HtmlFrameElement(_document), token.AsTag(), acknowledgeSelfClosing: true);
+                            AddElement(new HtmlFrameElement(_document), ref token, acknowledgeSelfClosing: true);
                         }
 
                         CloseCurrentNode();
                     }
                     else if (tagName.Is(TagNames.NoFrames))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
@@ -2574,7 +2631,7 @@ namespace AngleSharp.Html.Parser
                         }
                         else
                         {
-                            RaiseErrorOccurred(HtmlParseError.CurrentNodeIsRoot, token);
+                            RaiseErrorOccurred(HtmlParseError.CurrentNodeIsRoot, ref token);
                         }
 
                         return;
@@ -2586,7 +2643,7 @@ namespace AngleSharp.Html.Parser
                 {
                     if (CurrentNode != _document.DocumentElement)
                     {
-                        RaiseErrorOccurred(HtmlParseError.CurrentNodeIsNotRoot, token);
+                        RaiseErrorOccurred(HtmlParseError.CurrentNodeIsNotRoot, ref token);
                     }
 
                     End();
@@ -2594,14 +2651,14 @@ namespace AngleSharp.Html.Parser
                 }
             }
 
-            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
+            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.21 The "after frameset" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void AfterFrameset(HtmlToken token)
+        private void AfterFrameset(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -2619,12 +2676,12 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -2633,11 +2690,11 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                     }
                     else if (tagName.Is(TagNames.NoFrames))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
@@ -2663,14 +2720,14 @@ namespace AngleSharp.Html.Parser
                 }
             }
 
-            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
+            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.22 The "after after body" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void AfterAfterBody(HtmlToken token)
+        private void AfterAfterBody(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -2694,12 +2751,12 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    _document.AddComment(token);
+                    _document.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    InBody(token);
+                    InBody(ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -2709,27 +2766,27 @@ namespace AngleSharp.Html.Parser
                         break;
                     }
 
-                    InBody(token);
+                    InBody(ref token);
                     return;
                 }
             }
 
-            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
+            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
             _currentMode = HtmlTreeMode.InBody;
-            InBody(token);
+            InBody(ref token);
         }
 
         /// <summary>
         /// See 8.2.5.4.23 The "after after frameset" insertion mode.
         /// </summary>
         /// <param name="token">The passed token.</param>
-        private void AfterAfterFrameset(HtmlToken token)
+        private void AfterAfterFrameset(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
                 case HtmlTokenType.Comment:
                 {
-                    _document.AddComment(token);
+                    _document.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Character:
@@ -2748,7 +2805,7 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    InBody(token);
+                    InBody(ref token);
                     return;
                 }
                 case HtmlTokenType.StartTag:
@@ -2757,11 +2814,11 @@ namespace AngleSharp.Html.Parser
 
                     if (tagName.Is(TagNames.Html))
                     {
-                        InBody(token);
+                        InBody(ref token);
                     }
                     else if (tagName.Is(TagNames.NoFrames))
                     {
-                        InHead(token);
+                        InHead(ref token);
                     }
                     else
                     {
@@ -2777,7 +2834,7 @@ namespace AngleSharp.Html.Parser
                 }
             }
 
-            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, token);
+            RaiseErrorOccurred(HtmlParseError.TokenNotPossible, ref token);
         }
 
         #endregion
@@ -2789,12 +2846,12 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="token">The token to insert.</param>
         /// <param name="mode">The mode to push.</param>
-        private void TemplateStep(HtmlToken token, HtmlTreeMode mode)
+        private void TemplateStep(ref StructHtmlToken token, HtmlTreeMode mode)
         {
             _templateModes.Pop();
             _templateModes.Push(mode);
             _currentMode = mode;
-            Home(token);
+            Home(ref token);
         }
 
         /// <summary>
@@ -2831,18 +2888,18 @@ namespace AngleSharp.Html.Parser
         /// Closes the table if the section is in table scope.
         /// </summary>
         /// <param name="tag">The tag to insert (closes table).</param>
-        private void InTableBodyCloseTable(HtmlTagToken tag)
+        private void InTableBodyCloseTable(ref StructHtmlToken tag)
         {
             if (IsInTableScope(TagNames.AllTableSections))
             {
                 ClearStackBackTo(TagNames.AllTableSections);
                 CloseCurrentNode();
                 _currentMode = HtmlTreeMode.InTable;
-                InTable(tag);
+                InTable(ref tag);
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.TableSectionNotInScope, tag);
+                RaiseErrorOccurred(HtmlParseError.TableSectionNotInScope, ref tag);
             }
         }
 
@@ -2850,7 +2907,7 @@ namespace AngleSharp.Html.Parser
         /// Acts if a option end tag had been seen in the InSelect state.
         /// </summary>
         /// <param name="token">The actual tag token.</param>
-        private void InSelectEndTagOption(HtmlToken token)
+        private void InSelectEndTagOption(ref StructHtmlToken token)
         {
             if (CurrentNode.LocalName.Is(TagNames.Option))
             {
@@ -2858,7 +2915,7 @@ namespace AngleSharp.Html.Parser
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, token);
+                RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref token);
             }
         }
 
@@ -2866,7 +2923,7 @@ namespace AngleSharp.Html.Parser
         /// Acts if a optgroup end tag had been seen in the InSelect state.
         /// </summary>
         /// <param name="token">The actual tag token.</param>
-        private void InSelectEndTagOptgroup(HtmlToken token)
+        private void InSelectEndTagOptgroup(ref StructHtmlToken token)
         {
             if (_openElements.Count > 1 &&
                 _openElements[_openElements.Count - 1].LocalName.Is(TagNames.Option) &&
@@ -2881,7 +2938,7 @@ namespace AngleSharp.Html.Parser
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, token);
+                RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref token);
             }
         }
 
@@ -2890,7 +2947,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="token">The actual tag token.</param>
         /// <returns>True if the token was not ignored, otherwise false.</returns>
-        private Boolean InColumnGroupEndTagColgroup(HtmlToken token)
+        private Boolean InColumnGroupEndTagColgroup(ref StructHtmlToken token)
         {
             if (CurrentNode.LocalName.Is(TagNames.Colgroup))
             {
@@ -2900,7 +2957,7 @@ namespace AngleSharp.Html.Parser
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, token);
+                RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref token);
                 return false;
             }
         }
@@ -2909,9 +2966,9 @@ namespace AngleSharp.Html.Parser
         /// Act as if a body start tag has been found in the AfterHead state.
         /// </summary>
         /// <param name="token">The actual tag token.</param>
-        private void AfterHeadStartTagBody(HtmlTagToken token)
+        private void AfterHeadStartTagBody(ref StructHtmlToken token)
         {
-            AddElement(new HtmlBodyElement(_document), token);
+            AddElement(new HtmlBodyElement(_document), ref token);
             _frameset = false;
             _currentMode = HtmlTreeMode.InBody;
         }
@@ -2920,9 +2977,9 @@ namespace AngleSharp.Html.Parser
         /// Follows the generic rawtext parsing algorithm.
         /// </summary>
         /// <param name="tag">The given tag token.</param>
-        private void RawtextAlgorithm(HtmlTagToken tag)
+        private void RawtextAlgorithm(ref StructHtmlToken tag)
         {
-            AddElement(tag);
+            AddElement(ref tag);
             SwitchToRawtext();
         }
 
@@ -2937,9 +2994,9 @@ namespace AngleSharp.Html.Parser
         /// Follows the generic RCData parsing algorithm.
         /// </summary>
         /// <param name="tag">The given tag token.</param>
-        private void RCDataAlgorithm(HtmlTagToken tag)
+        private void RCDataAlgorithm(ref StructHtmlToken tag)
         {
-            AddElement(tag);
+            AddElement(ref tag);
             _previousMode = _currentMode;
             _currentMode = HtmlTreeMode.Text;
             _tokenizer.State = HtmlParseMode.RCData;
@@ -2949,7 +3006,7 @@ namespace AngleSharp.Html.Parser
         /// Acts if a li tag in the InBody state has been found.
         /// </summary>
         /// <param name="tag">The actual tag given.</param>
-        private void InBodyStartTagListItem(HtmlTagToken tag)
+        private void InBodyStartTagListItem(ref StructHtmlToken tag)
         {
             var index = _openElements.Count - 1;
             var node = _openElements[index];
@@ -2959,7 +3016,8 @@ namespace AngleSharp.Html.Parser
             {
                 if (node.LocalName.Is(TagNames.Li))
                 {
-                    InBody(HtmlTagToken.Close(node.LocalName));
+                    _temp = StructHtmlToken.Close(node.LocalName);
+                    InBody(ref _temp);
                     break;
                 }
 
@@ -2973,17 +3031,17 @@ namespace AngleSharp.Html.Parser
 
             if (IsInButtonScope())
             {
-                InBodyEndTagParagraph(tag);
+                InBodyEndTagParagraph(ref tag);
             }
 
-            AddElement(tag);
+            AddElement(ref tag);
         }
 
         /// <summary>
         /// Acts if a dd or dt tag in the InBody state has been found.
         /// </summary>
         /// <param name="tag">The actual tag given.</param>
-        private void InBodyStartTagDefinitionItem(HtmlTagToken tag)
+        private void InBodyStartTagDefinitionItem(ref StructHtmlToken tag)
         {
             _frameset = false;
             var index = _openElements.Count - 1;
@@ -2993,7 +3051,8 @@ namespace AngleSharp.Html.Parser
             {
                 if (node.LocalName.IsOneOf(TagNames.Dd, TagNames.Dt))
                 {
-                    InBody(HtmlTagToken.Close(node.LocalName));
+                    _temp = StructHtmlToken.Close(node.LocalName);
+                    InBody(ref _temp);
                     break;
                 }
 
@@ -3007,10 +3066,10 @@ namespace AngleSharp.Html.Parser
 
             if (IsInButtonScope())
             {
-                InBodyEndTagParagraph(tag);
+                InBodyEndTagParagraph(ref tag);
             }
 
-            AddElement(tag);
+            AddElement(ref tag);
         }
 
         /// <summary>
@@ -3018,7 +3077,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="tag">The actual tag given.</param>
         /// <returns>True if the token was not ignored, otherwise false.</returns>
-        private Boolean InBodyEndTagBlock(HtmlTagToken tag)
+        private Boolean InBodyEndTagBlock(ref StructHtmlToken tag)
         {
             if (IsInScope(tag.Name))
             {
@@ -3026,7 +3085,7 @@ namespace AngleSharp.Html.Parser
 
                 if (!CurrentNode.LocalName.Is(tag.Name))
                 {
-                    RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, tag);
+                    RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref tag);
                 }
 
                 ClearStackBackTo(tag.Name);
@@ -3035,7 +3094,7 @@ namespace AngleSharp.Html.Parser
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.BlockNotInScope, tag);
+                RaiseErrorOccurred(HtmlParseError.BlockNotInScope, ref tag);
                 return false;
             }
         }
@@ -3044,7 +3103,7 @@ namespace AngleSharp.Html.Parser
         /// Acts if a nobr tag had been seen in the InBody state.
         /// </summary>
         /// <param name="tag">The actual tag given.</param>
-        private void HeisenbergAlgorithm(HtmlTagToken tag)
+        private void HeisenbergAlgorithm(ref StructHtmlToken tag)
         {
             var currentNode = CurrentNode;
 
@@ -3080,7 +3139,7 @@ namespace AngleSharp.Html.Parser
 
                 if (formattingElement is null)
                 {
-                    InBodyEndTagAnythingElse(tag);
+                    InBodyEndTagAnythingElse(ref tag);
                     break;
                 }
 
@@ -3088,20 +3147,20 @@ namespace AngleSharp.Html.Parser
 
                 if (openIndex == -1)
                 {
-                    RaiseErrorOccurred(HtmlParseError.FormattingElementNotFound, tag);
+                    RaiseErrorOccurred(HtmlParseError.FormattingElementNotFound, ref tag);
                     _formattingElements.Remove(formattingElement);
                     break;
                 }
 
                 if (!IsInScope(formattingElement.LocalName))
                 {
-                    RaiseErrorOccurred(HtmlParseError.ElementNotInScope, tag);
+                    RaiseErrorOccurred(HtmlParseError.ElementNotInScope, ref tag);
                     break;
                 }
 
                 if (openIndex != _openElements.Count - 1)
                 {
-                    RaiseErrorOccurred(HtmlParseError.TagClosedWrong, tag);
+                    RaiseErrorOccurred(HtmlParseError.TagClosedWrong, ref tag);
                 }
 
                 var bookmark = index;
@@ -3226,10 +3285,10 @@ namespace AngleSharp.Html.Parser
         /// Performs the InBody state with foster parenting.
         /// </summary>
         /// <param name="token">The given token.</param>
-        private void InBodyWithFoster(HtmlToken token)
+        private void InBodyWithFoster(ref StructHtmlToken token)
         {
             _foster = true;
-            InBody(token);
+            InBody(ref token);
             _foster = false;
         }
 
@@ -3237,7 +3296,7 @@ namespace AngleSharp.Html.Parser
         /// Act as if an anything else tag has been found in the InBody state.
         /// </summary>
         /// <param name="tag">The actual tag found.</param>
-        private void InBodyEndTagAnythingElse(HtmlTagToken tag)
+        private void InBodyEndTagAnythingElse(ref StructHtmlToken tag)
         {
             var index = _openElements.Count - 1;
             var node = CurrentNode;
@@ -3250,7 +3309,7 @@ namespace AngleSharp.Html.Parser
 
                     if (!node.LocalName.Is(tag.Name))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagClosedWrong, tag);
+                        RaiseErrorOccurred(HtmlParseError.TagClosedWrong, ref tag);
                     }
 
                     CloseNodesFrom(index);
@@ -3258,7 +3317,7 @@ namespace AngleSharp.Html.Parser
                 }
                 else if ((node.Flags & NodeFlags.Special) == NodeFlags.Special)
                 {
-                    RaiseErrorOccurred(HtmlParseError.TagClosedWrong, tag);
+                    RaiseErrorOccurred(HtmlParseError.TagClosedWrong, ref tag);
                     break;
                 }
 
@@ -3271,17 +3330,17 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="token">The actual tag token.</param>
         /// <returns>True if the token was not ignored, otherwise false.</returns>
-        private Boolean InBodyEndTagBody(HtmlToken token)
+        private Boolean InBodyEndTagBody(ref StructHtmlToken token)
         {
             if (IsInScope(TagNames.Body))
             {
-                CheckBodyOnClosing(token);
+                CheckBodyOnClosing(ref token);
                 _currentMode = HtmlTreeMode.AfterBody;
                 return true;
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.BodyNotInScope, token);
+                RaiseErrorOccurred(HtmlParseError.BodyNotInScope, ref token);
                 return false;
             }
         }
@@ -3290,10 +3349,10 @@ namespace AngleSharp.Html.Parser
         /// Act as if an br start tag has been found in the InBody state.
         /// </summary>
         /// <param name="tag">The actual tag found.</param>
-        private void InBodyStartTagBreakrow(HtmlTagToken tag)
+        private void InBodyStartTagBreakrow(ref StructHtmlToken tag)
         {
             ReconstructFormatting();
-            AddElement(tag, acknowledgeSelfClosing: true);
+            AddElement(ref tag, acknowledgeSelfClosing: true);
             CloseCurrentNode();
             _frameset = false;
         }
@@ -3303,7 +3362,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="token">The actual tag token.</param>
         /// <returns>True if the token was found, otherwise false.</returns>
-        private Boolean InBodyEndTagParagraph(HtmlToken token)
+        private Boolean InBodyEndTagParagraph(ref StructHtmlToken token)
         {
             if (IsInButtonScope())
             {
@@ -3311,7 +3370,7 @@ namespace AngleSharp.Html.Parser
 
                 if (!CurrentNode.LocalName.Is(TagNames.P))
                 {
-                    RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, token);
+                    RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref token);
                 }
 
                 ClearStackBackTo(TagNames.P);
@@ -3320,9 +3379,10 @@ namespace AngleSharp.Html.Parser
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.ParagraphNotInScope, token);
-                Consume(HtmlTagToken.Open(TagNames.P));
-                InBodyEndTagParagraph(token);
+                RaiseErrorOccurred(HtmlParseError.ParagraphNotInScope, ref token);
+                _temp = StructHtmlToken.Open(TagNames.P);
+                Consume(ref _temp);
+                InBodyEndTagParagraph(ref token);
                 return false;
             }
         }
@@ -3332,7 +3392,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="token">The actual tag token.</param>
         /// <returns>True if the token was not ignored, otherwise false.</returns>
-        private Boolean InTableEndTagTable(HtmlToken token)
+        private Boolean InTableEndTagTable(ref StructHtmlToken token)
         {
             if (IsInTableScope(TagNames.Table))
             {
@@ -3343,7 +3403,7 @@ namespace AngleSharp.Html.Parser
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.TableNotInScope, token);
+                RaiseErrorOccurred(HtmlParseError.TableNotInScope, ref token);
                 return false;
             }
         }
@@ -3353,7 +3413,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="token">The actual tag token.</param>
         /// <returns>True if the token was not ignored, otherwise false.</returns>
-        private Boolean InRowEndTagTablerow(HtmlToken token)
+        private Boolean InRowEndTagTablerow(ref StructHtmlToken token)
         {
             if (IsInTableScope(TagNames.Tr))
             {
@@ -3364,7 +3424,7 @@ namespace AngleSharp.Html.Parser
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.TableRowNotInScope, token);
+                RaiseErrorOccurred(HtmlParseError.TableRowNotInScope, ref token);
                 return false;
             }
         }
@@ -3385,7 +3445,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="token">The actual tag token.</param>
         /// <returns>True if the token was not ignored, otherwise false.</returns>
-        private Boolean InCaptionEndTagCaption(HtmlToken token)
+        private Boolean InCaptionEndTagCaption(ref StructHtmlToken token)
         {
             if (IsInTableScope(TagNames.Caption))
             {
@@ -3393,7 +3453,7 @@ namespace AngleSharp.Html.Parser
 
                 if (!CurrentNode.LocalName.Is(TagNames.Caption))
                 {
-                    RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, token);
+                    RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref token);
                 }
 
                 ClearStackBackTo(TagNames.Caption);
@@ -3404,7 +3464,7 @@ namespace AngleSharp.Html.Parser
             }
             else
             {
-                RaiseErrorOccurred(HtmlParseError.CaptionNotInScope, token);
+                RaiseErrorOccurred(HtmlParseError.CaptionNotInScope, ref token);
                 return false;
             }
         }
@@ -3413,13 +3473,13 @@ namespace AngleSharp.Html.Parser
         /// Act as if an td or th end tag has been found in the InCell state.
         /// </summary>
         /// <param name="token">The actual tag token.</param>
-        private void InCellEndTagCell(HtmlToken token)
+        private void InCellEndTagCell(ref StructHtmlToken token)
         {
             GenerateImpliedEndTags();
 
             if (!TagNames.AllTableCells.Contains(CurrentNode.LocalName))
             {
-                RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, token);
+                RaiseErrorOccurred(HtmlParseError.TagDoesNotMatchCurrentNode, ref token);
             }
 
             ClearStackBackTo(TagNames.AllTableCells);
@@ -3436,7 +3496,7 @@ namespace AngleSharp.Html.Parser
         /// 8.2.5.5 The rules for parsing tokens in foreign content
         /// </summary>
         /// <param name="token">The token to examine.</param>
-        private void Foreign(HtmlToken token)
+        private void Foreign(ref StructHtmlToken token)
         {
             switch (token.Type)
             {
@@ -3449,28 +3509,27 @@ namespace AngleSharp.Html.Parser
                 case HtmlTokenType.StartTag:
                 {
                     var tagName = token.Name;
-                    var tag = token.AsTag();
 
                     if (tagName.Is(TagNames.Font))
                     {
-                        for (var i = 0; i != tag.Attributes.Count; i++)
+                        for (var i = 0; i != token.Attributes.Count; i++)
                         {
-                            if (tag.Attributes[i].Name.IsOneOf(AttributeNames.Color, AttributeNames.Face, AttributeNames.Size))
+                            if (token.Attributes[i].Name.IsOneOf(AttributeNames.Color, AttributeNames.Face, AttributeNames.Size))
                             {
-                                ForeignNormalTag(tag);
+                                ForeignNormalTag(ref token);
                                 return;
                             }
                         }
 
-                        ForeignSpecialTag(tag);
+                        ForeignSpecialTag(ref token);
                     }
-                    else if (TagNames.AllForeignExceptions.Contains(tagName))
+                    else if (TagNames._mAllForeignExceptions.Contains(tagName))
                     {
-                        ForeignNormalTag(tag);
+                        ForeignNormalTag(ref token);
                     }
                     else
                     {
-                        ForeignSpecialTag(tag);
+                        ForeignSpecialTag(ref token);
                     }
 
                     return;
@@ -3488,7 +3547,7 @@ namespace AngleSharp.Html.Parser
 
                     if (!node.LocalName.Is(tagName))
                     {
-                        RaiseErrorOccurred(HtmlParseError.TagClosingMismatch, token);
+                        RaiseErrorOccurred(HtmlParseError.TagClosingMismatch, ref token);
                     }
 
                     for (var i = _openElements.Count - 1; i > 0; i--)
@@ -3503,7 +3562,7 @@ namespace AngleSharp.Html.Parser
 
                         if ((node.Flags & NodeFlags.HtmlMember) == NodeFlags.HtmlMember)
                         {
-                            Home(token);
+                            Home(ref token);
                             break;
                         }
                     }
@@ -3512,12 +3571,12 @@ namespace AngleSharp.Html.Parser
                 }
                 case HtmlTokenType.Comment:
                 {
-                    CurrentNode.AddComment(token);
+                    CurrentNode.AddComment(ref token);
                     return;
                 }
                 case HtmlTokenType.Doctype:
                 {
-                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, token);
+                    RaiseErrorOccurred(HtmlParseError.DoctypeTagInappropriate, ref token);
                     return;
                 }
             }
@@ -3527,9 +3586,9 @@ namespace AngleSharp.Html.Parser
         /// Processes a special start tag token.
         /// </summary>
         /// <param name="tag">The tag token to process.</param>
-        private void ForeignSpecialTag(HtmlTagToken tag)
+        private void ForeignSpecialTag(ref StructHtmlToken tag)
         {
-            var node = CreateForeignElementFrom(tag);
+            var node = CreateForeignElementFrom(ref tag);
 
             if (node != null)
             {
@@ -3548,7 +3607,8 @@ namespace AngleSharp.Html.Parser
                 }
                 else if (tag.Name.Is(TagNames.Script))
                 {
-                    Foreign(HtmlTagToken.Close(TagNames.Script));
+                    _temp = StructHtmlToken.Close(TagNames.Script);
+                    Foreign(ref _temp);
                 }
             }
         }
@@ -3558,21 +3618,21 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="tag">The tag of the foreign element.</param>
         /// <returns>The element or NULL if it is no MathML or SVG element.</returns>
-        private Element? CreateForeignElementFrom(HtmlTagToken tag)
+        private Element? CreateForeignElementFrom(ref StructHtmlToken tag)
         {
             if ((AdjustedCurrentNode!.Flags & NodeFlags.MathMember) == NodeFlags.MathMember)
             {
                 var tagName = tag.Name;
-                var element = _document.CreateMathElement(tagName);
-                AuxiliarySetupSteps(element, tag);
-                return element.Setup(tag);
+                var element = _document.CreateMathElement(tagName.String);
+                AuxiliarySetupSteps(element, ref tag);
+                return element.Setup(ref tag);
             }
             else if ((AdjustedCurrentNode.Flags & NodeFlags.SvgMember) == NodeFlags.SvgMember)
             {
-                var tagName = tag.Name.SanatizeSvgTagName();
+                var tagName = tag.Name.String.SanatizeSvgTagName();
                 var element = _document.CreateSvgElement(tagName);
-                AuxiliarySetupSteps(element, tag);
-                return element.Setup(tag);
+                AuxiliarySetupSteps(element, ref tag);
+                return element.Setup(ref tag);
             }
 
             return null;
@@ -3582,9 +3642,9 @@ namespace AngleSharp.Html.Parser
         /// Processes a normal start tag token.
         /// </summary>
         /// <param name="tag">The token to process.</param>
-        private void ForeignNormalTag(HtmlTagToken tag)
+        private void ForeignNormalTag(ref StructHtmlToken tag)
         {
-            RaiseErrorOccurred(HtmlParseError.TagCannotStartHere, tag);
+            RaiseErrorOccurred(HtmlParseError.TagCannotStartHere, ref tag);
 
             if (!IsFragmentCase)
             {
@@ -3599,7 +3659,7 @@ namespace AngleSharp.Html.Parser
 
                         if (value.Isi(MimeTypeNames.Html) || value.Isi(MimeTypeNames.ApplicationXHtml))
                         {
-                            AddElement(tag);
+                            AddElement(ref tag);
                             return;
                         }
                     }
@@ -3609,11 +3669,11 @@ namespace AngleSharp.Html.Parser
                 }
                 while ((node.Flags & Annotated) == NodeFlags.None);
 
-                Consume(tag);
+                Consume(ref tag);
             }
             else
             {
-                ForeignSpecialTag(tag);
+                ForeignSpecialTag(ref tag);
             }
         }
 
@@ -3626,7 +3686,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="tagName">The tag name to check.</param>
         /// <returns>True if it is in scope, otherwise false.</returns>
-        private Boolean IsInScope(String tagName)
+        private Boolean IsInScope(StringOrMemory tagName)
         {
             for (var i = _openElements.Count - 1; i >= 0; i--)
             {
@@ -3742,7 +3802,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="tagName">The tag name to check.</param>
         /// <returns>True if it is in scope, otherwise false.</returns>
-        private Boolean IsInTableScope(String tagName)
+        private Boolean IsInTableScope(StringOrMemory tagName)
         {
             for (var i = _openElements.Count - 1; i >= 0; i--)
             {
@@ -3761,12 +3821,13 @@ namespace AngleSharp.Html.Parser
             return false;
         }
 
+
         /// <summary>
         /// Determines if the given tag name is in the select scope.
         /// </summary>
         /// <param name="tagName">The tag name to check.</param>
         /// <returns>True if it is in scope, otherwise false.</returns>
-        private Boolean IsInSelectScope(String tagName)
+        private Boolean IsInSelectScope(StringOrMemory tagName)
         {
             for (var i = _openElements.Count - 1; i >= 0; i--)
             {
@@ -3792,7 +3853,7 @@ namespace AngleSharp.Html.Parser
         /// <summary>
         /// Checks if the given tag name should be considered as a "custom element everywhere".
         /// </summary>
-        private Boolean IsCustomElementEverywhere(String tagName) => _options.IsAcceptingCustomElementsEverywhere && tagName.IsCustomElement();
+        private Boolean IsCustomElementEverywhere(StringOrMemory tagName) => _options.IsAcceptingCustomElementsEverywhere && tagName.IsCustomElement();
 
         /// <summary>
         /// Runs a script given by the current node.
@@ -3839,13 +3900,13 @@ namespace AngleSharp.Html.Parser
         /// element, a tr element, the body element, or the html element, then
         /// this is a parse error.
         /// </summary>
-        private void CheckBodyOnClosing(HtmlToken token)
+        private void CheckBodyOnClosing(ref StructHtmlToken token)
         {
             for (var i = 0; i < _openElements.Count; i++)
             {
                 if ((_openElements[i].Flags & NodeFlags.ImplicitlyClosed) != NodeFlags.ImplicitlyClosed)
                 {
-                    RaiseErrorOccurred(HtmlParseError.BodyClosedWrong, token);
+                    RaiseErrorOccurred(HtmlParseError.BodyClosedWrong, ref token);
                     break;
                 }
             }
@@ -3856,7 +3917,7 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="tagName">The name of the tag to check for.</param>
         /// <returns>True if such a tag is open, otherwise false.</returns>
-        private Boolean TagCurrentlyOpen(String tagName)
+        private Boolean TagCurrentlyOpen(StringOrMemory tagName)
         {
             for (var i = 0; i < _openElements.Count; i++)
             {
@@ -3881,7 +3942,7 @@ namespace AngleSharp.Html.Parser
                 temp.RemoveNewLine();
             }
 
-            Home(temp);
+            Home(ref temp);
         }
 
         /// <summary>
@@ -3908,11 +3969,11 @@ namespace AngleSharp.Html.Parser
         /// Adds the root element (html) to the document.
         /// </summary>
         /// <param name="tag">The token which started this process.</param>
-        private void AddRoot(HtmlTagToken tag)
+        private void AddRoot(ref StructHtmlToken tag)
         {
             var element = new HtmlHtmlElement(_document);
             _document.AddNode(element);
-            SetupElement(element, tag, false);
+            SetupElement(element, ref tag, false);
             _openElements.Add(element);
             _tokenizer.IsAcceptingCharacterData = false;
             _document.ApplyManifest();
@@ -3971,14 +4032,14 @@ namespace AngleSharp.Html.Parser
         /// <param name="element">The node which will be added to the list.</param>
         /// <param name="tag">The associated tag token.</param>
         /// <param name="acknowledgeSelfClosing">Should the self-closing be acknowledged?</param>
-        private void SetupElement(Element element, HtmlTagToken tag, Boolean acknowledgeSelfClosing)
+        private void SetupElement(Element element, ref StructHtmlToken tag, Boolean acknowledgeSelfClosing)
         {
             if (tag.IsSelfClosing && !acknowledgeSelfClosing)
             {
-                RaiseErrorOccurred(HtmlParseError.TagCannotBeSelfClosed, tag);
+                RaiseErrorOccurred(HtmlParseError.TagCannotBeSelfClosed, ref tag);
             }
 
-            AuxiliarySetupSteps(element, tag);
+            AuxiliarySetupSteps(element, ref tag);
             element.SetAttributes(tag.Attributes);
         }
 
@@ -3989,10 +4050,10 @@ namespace AngleSharp.Html.Parser
         /// </summary>
         /// <param name="tag">The associated tag token.</param>
         /// <param name="acknowledgeSelfClosing">Should the self-closing be acknowledged?</param>
-        private Element AddElement(HtmlTagToken tag, Boolean acknowledgeSelfClosing = false)
+        private Element AddElement(ref StructHtmlToken tag, Boolean acknowledgeSelfClosing = false)
         {
-            var element = _document.CreateHtmlElement(tag.Name);
-            SetupElement(element, tag, acknowledgeSelfClosing);
+            var element = _document.CreateHtmlElement(tag.Name.String);
+            SetupElement(element, ref tag, acknowledgeSelfClosing);
             AddElement(element);
             return element;
         }
@@ -4001,9 +4062,9 @@ namespace AngleSharp.Html.Parser
         /// Appends a template element.
         /// </summary>
         /// <param name="tag">The associated tag token.</param>
-        private void AddTemplateElement(HtmlTagToken tag)
+        private void AddTemplateElement(ref StructHtmlToken tag)
         {
-            AddElement(new HtmlTemplateElement(_document), tag);
+            AddElement(new HtmlTemplateElement(_document), ref tag);
             _formattingElements.AddScopeMarker();
             _frameset = false;
             _currentMode = HtmlTreeMode.InTemplate;
@@ -4018,9 +4079,9 @@ namespace AngleSharp.Html.Parser
         /// <param name="element">The node which will be added to the list.</param>
         /// <param name="tag">The associated tag token.</param>
         /// <param name="acknowledgeSelfClosing">Should the self-closing be acknowledged?</param>
-        private void AddElement(Element element, HtmlTagToken tag, Boolean acknowledgeSelfClosing = false)
+        private void AddElement(Element element, ref StructHtmlToken tag, Boolean acknowledgeSelfClosing = false)
         {
-            SetupElement(element, tag, acknowledgeSelfClosing);
+            SetupElement(element, ref tag, acknowledgeSelfClosing);
             AddElement(element);
         }
 
@@ -4092,9 +4153,9 @@ namespace AngleSharp.Html.Parser
         /// Inserts the given characters into the current node.
         /// </summary>
         /// <param name="text">The characters to insert.</param>
-        private void AddCharacters(String text)
+        private void AddCharacters(StringOrMemory text)
         {
-            if (!String.IsNullOrEmpty(text))
+            if (text.Length != 0)
             {
                 var node = CurrentNode;
 
@@ -4104,7 +4165,7 @@ namespace AngleSharp.Html.Parser
                 }
                 else
                 {
-                    node.AppendText(text);
+                    node.AppendText(text.String);
                 }
             }
         }
@@ -4113,7 +4174,7 @@ namespace AngleSharp.Html.Parser
         /// Inserts the given character into the foster parent.
         /// </summary>
         /// <param name="text">The character to insert.</param>
-        private void AddCharactersWithFoster(String text)
+        private void AddCharactersWithFoster(StringOrMemory text)
         {
             var table = false;
             var index = _openElements.Count;
@@ -4122,7 +4183,7 @@ namespace AngleSharp.Html.Parser
             {
                 if (_openElements[index].LocalName.Is(TagNames.Template))
                 {
-                    _openElements[index].AppendText(text);
+                    _openElements[index].AppendText(text.String);
                     return;
                 }
                 else if (_openElements[index].LocalName.Is(TagNames.Table))
@@ -4140,22 +4201,22 @@ namespace AngleSharp.Html.Parser
                 {
                     if (foster.ChildNodes[i] == _openElements[index])
                     {
-                        foster.InsertText(i, text);
+                        foster.InsertText(i, text.String);
                         break;
                     }
                 }
             }
             else
             {
-                foster.AppendText(text);
+                foster.AppendText(text.String);
             }
         }
 
-        private void AuxiliarySetupSteps(Element element, HtmlTagToken tag)
+        private void AuxiliarySetupSteps(Element element, ref StructHtmlToken tag)
         {
             if (_options.IsKeepingSourceReferences)
             {
-                element.SourceReference = tag;
+                // element.SourceReference = tag.ToHtmlToken();
             }
 
             if (_options.OnCreated != null)
@@ -4172,7 +4233,7 @@ namespace AngleSharp.Html.Parser
         /// Clears the stack of open elements back to the given element name.
         /// </summary>
         /// <param name="tagName">The tag that will be the CurrentNode.</param>
-        private void ClearStackBackTo(String tagName)
+        private void ClearStackBackTo(StringOrMemory tagName)
         {
             var node = CurrentNode;
 
@@ -4202,7 +4263,7 @@ namespace AngleSharp.Html.Parser
         /// the tag given.
         /// </summary>
         /// <param name="tagName">The tag that will be excluded.</param>
-        private void GenerateImpliedEndTagsExceptFor(String tagName)
+        private void GenerateImpliedEndTagsExceptFor(StringOrMemory tagName)
         {
             var node = CurrentNode;
 
@@ -4269,8 +4330,13 @@ namespace AngleSharp.Html.Parser
 
         #region Handlers
 
-        private void RaiseErrorOccurred(HtmlParseError code, HtmlToken token) => _tokenizer.RaiseErrorOccurred(code, token.Position);
+        private void RaiseErrorOccurred(HtmlParseError code, ref StructHtmlToken token) => _tokenizer.RaiseErrorOccurred(code, token.Position);
 
         #endregion
+
+        public void Dispose()
+        {
+            _tokenizer.Dispose();
+        }
     }
 }
