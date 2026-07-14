@@ -63,6 +63,16 @@ namespace AngleSharp.Text
         }
 
         /// <summary>
+        /// Creates a text source over the supplied read-only source implementation.
+        /// </summary>
+        /// <param name="source">The underlying source.</param>
+        public TextSource(IReadOnlyTextSource source)
+        {
+            _writableSource = source as WritableTextSource;
+            _readOnlyTextSource = source ?? throw new ArgumentNullException(nameof(source));
+        }
+
+        /// <summary>
         /// Creates a new immutable text source from a <see cref="StringTextSource"/>. No underlying stream will be used
         /// </summary>
         public TextSource(StringTextSource source)

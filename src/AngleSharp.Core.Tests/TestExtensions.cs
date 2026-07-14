@@ -6,9 +6,14 @@ namespace AngleSharp.Core.Tests
     using AngleSharp.Html.Parser;
     using AngleSharp.Io;
     using AngleSharp.Scripting;
+    using AngleSharp.Text;
+#if NET10_0
+    using AngleSharp.Text.Experimental;
+#endif
     using NUnit.Framework;
     using System;
     using System.IO;
+    using System.Text;
 
     static class TestExtensions
     {
@@ -74,6 +79,14 @@ namespace AngleSharp.Core.Tests
                 htmlParser.Error += onError;
             }
 
+#if NET10_0
+            if (TestRuntime.UseUtf8StreamingTextSource)
+            {
+                var stream = new MemoryStream(Encoding.UTF8.GetBytes(sourceCode), writable: false);
+                var textSource = new TextSource(new Utf8StreamingTextSource(stream));
+                return ((HtmlParser)htmlParser).ParseDocumentAsync(textSource, default).GetAwaiter().GetResult();
+            }
+#endif
             if (TestRuntime.UsePrefetchedTextSource)
             {
                 return htmlParser.ParseDocument(sourceCode.AsMemory());
