@@ -3,6 +3,7 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -15,16 +16,18 @@ using AngleSharp.Html.Parser.Utf8;
 using AngleSharp.Text;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Diagnosers;
+using BenchmarkDotNet.Jobs;
 
 namespace AngleSharp.Benchmarks;
 
 /// <summary>
-/// Compares mutable DOM construction from raw UTF-8 using the mature decoder/tokenizer and the arena-backed native
-/// UTF-8 token adapter. All lanes publish the same ordinary mutable AngleSharp DOM.
+/// Reparses normalized real pages after removing one structural dimension. This is a causal probe for the
+/// mature-versus-native mutable-DOM gap, not a representative throughput benchmark.
 /// </summary>
 [MemoryDiagnoser]
 [HardwareCounters(HardwareCounter.InstructionRetired)]
-public class Utf8MutableDomBenchmark
+[SimpleJob(warmupCount: 2, iterationCount: 5)]
+public class Utf8MutableDomAblationBenchmark
 {
     private const Int32 NetworkBufferSize = 4096;
 
@@ -34,44 +37,39 @@ public class Utf8MutableDomBenchmark
     private Byte[] _utf8 = null!;
     private String _expectedMarkup = null!;
 
-    [Params(
-        "page.html",
-        "nbc.html",
-        "utf8_edu.bin",
-        "en.wikipedia.html",
-        "stackoverflow.html",
-        "youtube.html",
-        "spiegel.html"
-    )]
+    [Params("en.wikipedia.html", "stackoverflow.html", "youtube.html", "spiegel.html")]
     public String CorpusFile { get; set; } = null!;
+
+    [Params(Ablation.Normalized, Ablation.NoAttributes, Ablation.NoScriptBodies)]
+    public Ablation Variant { get; set; }
 
     [GlobalSetup]
     public async Task Setup()
     {
-        _utf8 = File.ReadAllBytes(CorpusFile);
         _context = BrowsingContext.New(Configuration.Default);
-        _factory = _context.GetService<IHtmlElementConstructionFactory>() ?? HtmlDomConstructionFactory.Instance;
+        _factory = _context.GetService<IHtmlElementConstructionFactory>()
+            ?? HtmlDomConstructionFactory.Instance;
         _parser = new HtmlParser(_context);
+
+        using var source = _parser.ParseDocument(
+            Encoding.UTF8.GetString(File.ReadAllBytes(CorpusFile))
+        );
+        ApplyAblation(source, Variant);
+        _utf8 = Encoding.UTF8.GetBytes(source.DocumentElement.OuterHtml);
 
         using var expected = _parser.ParseDocument(Encoding.UTF8.GetString(_utf8));
         _expectedMarkup = expected.DocumentElement.OuterHtml;
         using var actual = await ParseUtf8Async(SingleChunk(_utf8)).ConfigureAwait(false);
         if (!String.Equals(actual.DocumentElement.OuterHtml, _expectedMarkup, StringComparison.Ordinal))
         {
-            throw new InvalidOperationException("Arena-backed UTF-8 mutable DOM differs from the mature parser.");
+            throw new InvalidOperationException(
+                $"Native UTF-8 DOM differs for {CorpusFile} / {Variant}."
+            );
         }
     }
 
-    [Benchmark(Baseline = true), BenchmarkCategory("Network4K")]
-    public async Task<Int32> AccumulatingUtf16Network4K()
-    {
-        using var stream = new NetworkReadStream(_utf8, NetworkBufferSize);
-        using var document = await _parser.ParseDocumentAsync(stream, default).ConfigureAwait(false);
-        return document.All.Length;
-    }
-
-    [Benchmark, BenchmarkCategory("Network4K")]
-    public async Task<Int32> BoundedUtf16Network4K()
+    [Benchmark(Baseline = true)]
+    public async Task<Int32> Mature()
     {
         using var stream = new NetworkReadStream(_utf8, NetworkBufferSize);
         using var document = await _parser
@@ -80,25 +78,33 @@ public class Utf8MutableDomBenchmark
         return document.All.Length;
     }
 
-    [Benchmark, BenchmarkCategory("Network4K")]
-    public async Task<Int32> NativeUtf8Network4K()
+    [Benchmark]
+    public async Task<Int32> NativeUtf8()
     {
-        using var document = await ParseUtf8Async(NetworkChunks(_utf8, NetworkBufferSize)).ConfigureAwait(false);
+        using var document = await ParseUtf8Async(NetworkChunks(_utf8, NetworkBufferSize))
+            .ConfigureAwait(false);
         return document.All.Length;
     }
 
-    [Benchmark, BenchmarkCategory("Contiguous")]
-    public Int32 MatureContiguousUtf16()
+    private static void ApplyAblation(IDocument document, Ablation variant)
     {
-        using var document = _parser.ParseDocument(Encoding.UTF8.GetString(_utf8));
-        return document.All.Length;
-    }
-
-    [Benchmark, BenchmarkCategory("Contiguous")]
-    public async Task<Int32> ArenaUtf8Contiguous()
-    {
-        using var document = await ParseUtf8Async(SingleChunk(_utf8)).ConfigureAwait(false);
-        return document.All.Length;
+        if (variant == Ablation.NoAttributes)
+        {
+            foreach (var element in document.All.ToArray())
+            {
+                foreach (var name in element.Attributes.Select(attribute => attribute.Name).ToArray())
+                {
+                    element.RemoveAttribute(name);
+                }
+            }
+        }
+        else if (variant == Ablation.NoScriptBodies)
+        {
+            foreach (var script in document.QuerySelectorAll("script"))
+            {
+                script.TextContent = String.Empty;
+            }
+        }
     }
 
     private async Task<IDocument> ParseUtf8Async(IAsyncEnumerable<ReadOnlyMemory<Byte>> input)
@@ -138,6 +144,13 @@ public class Utf8MutableDomBenchmark
         }
     }
 
+    public enum Ablation : Byte
+    {
+        Normalized,
+        NoAttributes,
+        NoScriptBodies,
+    }
+
     private sealed class NetworkReadStream(Byte[] source, Int32 maxReadSize) : Stream
     {
         private Int32 _position;
@@ -152,7 +165,8 @@ public class Utf8MutableDomBenchmark
             set => throw new NotSupportedException();
         }
 
-        public override Int32 Read(Byte[] buffer, Int32 offset, Int32 count) => Read(buffer.AsSpan(offset, count));
+        public override Int32 Read(Byte[] buffer, Int32 offset, Int32 count) =>
+            Read(buffer.AsSpan(offset, count));
 
         public override Int32 Read(Span<Byte> buffer)
         {
@@ -180,7 +194,8 @@ public class Utf8MutableDomBenchmark
         public override void Flush() { }
         public override Int64 Seek(Int64 offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(Int64 value) => throw new NotSupportedException();
-        public override void Write(Byte[] buffer, Int32 offset, Int32 count) => throw new NotSupportedException();
+        public override void Write(Byte[] buffer, Int32 offset, Int32 count) =>
+            throw new NotSupportedException();
     }
 }
 #endif

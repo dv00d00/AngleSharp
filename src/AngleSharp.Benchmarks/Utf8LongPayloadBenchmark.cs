@@ -322,8 +322,8 @@ public class RoughBench
     private const Int32 UnitsPerSlice = 8;
 
     // "aЖ🙂"
-    private const Int32 BytesPerUnit = 7;
-    private const Int32 CharsPerUnit = 4;
+    private const Int32 BytesPerUnit = 3;
+    private const Int32 CharsPerUnit = 3;
 
     private const Int32 BytesPerSlice = UnitsPerSlice * BytesPerUnit; // 56
     private const Int32 CharsPerSlice = UnitsPerSlice * CharsPerUnit; // 32
@@ -335,25 +335,12 @@ public class RoughBench
     public void Setup()
     {
         var text = String.Concat(
-            Enumerable.Repeat("aЖ🙂", PayloadUnits)
+            Enumerable.Repeat("zzz", PayloadUnits)
+            // Enumerable.Repeat("aЖ🙂", PayloadUnits)
         );
 
         _utf8 = Encoding.UTF8.GetBytes(text);
         _chars = text.ToCharArray();
-
-        if (_utf8.Length != PayloadUnits * BytesPerUnit)
-        {
-            throw new InvalidOperationException(
-                $"Unexpected UTF-8 size: {_utf8.Length}."
-            );
-        }
-
-        if (_chars.Length != PayloadUnits * CharsPerUnit)
-        {
-            throw new InvalidOperationException(
-                $"Unexpected UTF-16 size: {_chars.Length}."
-            );
-        }
     }
 
     [Benchmark(Baseline = true)]
@@ -392,11 +379,36 @@ public class RoughBench
         {
             var byteOffset = unitOffset * BytesPerUnit;
 
-            var value = Encoding.UTF8.GetString(
-                _utf8,
-                byteOffset,
-                BytesPerSlice
-            );
+            var value = String.Create(
+                BytesPerSlice,
+                (Bytes: _utf8, Offset: byteOffset),
+                static (destination, state) =>
+                {
+                    var source = state.Bytes.AsSpan(state.Offset, destination.Length);
+
+                    for (var i = 0; i < destination.Length; i++)
+                    {
+                        destination[i] = (Char)source[i];
+                    }
+                });
+
+            checksum = unchecked((checksum * 31) + value.Length);
+        }
+
+        return checksum;
+    }
+
+    [Benchmark]
+    public Int32 DecodeEachSliceAscii()
+    {
+        var checksum = 0;
+        var sliceCount = PayloadUnits - UnitsPerSlice + 1;
+
+        for (var unitOffset = 0; unitOffset < sliceCount; unitOffset++)
+        {
+            var byteOffset = unitOffset * BytesPerUnit;
+
+            var value = Encoding.ASCII.GetString(_utf8.AsSpan(byteOffset, BytesPerSlice));
 
             checksum = unchecked((checksum * 31) + value.Length);
         }
