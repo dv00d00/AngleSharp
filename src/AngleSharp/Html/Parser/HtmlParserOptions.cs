@@ -59,6 +59,17 @@ namespace AngleSharp.Html.Parser
         public Boolean IsKeepingSourceReferences { get; set; }
 
         /// <summary>
+        /// Gets or sets if whitespace-only text nodes should be kept
+        /// when parsing into a custom tree via the generic construction
+        /// entry points, e.g.,
+        /// <see cref="HtmlParser.ParseDocument{TDocument,TElement}(TextSource, TokenizerMiddleware)"/>.
+        /// By default, custom tree construction drops whitespace-only
+        /// text runs. This option only affects custom / generic tree
+        /// construction; the standard DOM always keeps these nodes.
+        /// </summary>
+        public Boolean IsKeepingWhitespaceTextNodes { get; set; }
+
+        /// <summary>
         /// Gets or sets if the parsing of character references should
         /// be avoided.
         /// Note: With this option there is no way to determine from

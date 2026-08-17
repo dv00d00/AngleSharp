@@ -5,6 +5,7 @@ Released on Friday, July 31 2026
 - Improved CSS selector performance (#1270, #929) @lahma
 - Added support for the `:host` pseudo selector (#1271)
 - Added support for the DomGeometry spec (#1193)
+- Added `IsKeepingWhitespaceTextNodes` option to keep whitespace-only text nodes in custom tree construction @dv00d00
 
 # 1.6.0
 

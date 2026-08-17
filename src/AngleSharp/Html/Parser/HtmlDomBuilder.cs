@@ -61,7 +61,7 @@
         private Func<TNode, Boolean>? _shouldEnd;
         private readonly IHtmlTreeConstructionFactory<TDocument, TNode> _elementFactory;
         private Task? _waiting;
-        private readonly Boolean _emitWhitespaceTextNodes;
+        private Boolean _emitWhitespaceTextNodes;
         private readonly Boolean _usesDocumentSource;
 
         #endregion
@@ -432,6 +432,10 @@
         private void SetOptions(HtmlParserOptions options)
         {
             _options = options;
+            // The mutable DOM builder constructs with emitWhitespaceTextNodes: true,
+            // so the option can only widen behavior — it never drops nodes a caller
+            // already receives today.
+            _emitWhitespaceTextNodes |= options.IsKeepingWhitespaceTextNodes;
             _tokenizerConfiguration.Configure(new HtmlTokenizerOptions(options), options.OnToken, ReportError);
         }
 
